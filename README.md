@@ -139,4 +139,4 @@ claude mcp add code-explorer -- npx -y claude-code-explorer-mcp
 ---
 
 ### 📩 Contact
-For any questions, concerns, or inquiries, please reach out to **yixbinfo@gmail.com**.
+For spamming reasons the email has been removed
