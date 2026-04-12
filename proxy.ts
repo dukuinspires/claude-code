@@ -9,6 +9,9 @@
  *   2. OpenAI fallback → if Claude upstream fails, retries against OpenAI directly
  *   3. Rate limit handling → 429s from Claude are retried with backoff
  *   4. Refresh lock → prevents concurrent refresh race condition
+ *   5. Concurrency limiter → foreground (4 slots) + background (2 slots)
+ *      Background calls (queue/enrichment) yield to live user queries.
+ *      Set PROXY_FOREGROUND_SLOTS / PROXY_BACKGROUND_SLOTS to tune.
  *
  * Usage: bun run proxy.ts
  */
@@ -39,6 +42,64 @@ let _refreshInProgress: Promise<string | null> | null = null;
 // Consecutive 401 counter — triggers alert when refresh token is dead
 let _consecutiveAuthFailures = 0;
 const AUTH_FAILURE_ALERT_THRESHOLD = 3;
+
+// ─── Concurrency limiter ─────────────────────────────────────────────────────
+// Mirrors how the a1 proxy serialises requests from multiple terminals via
+// localhost:3099. Without this, batch background calls (enrichment, queue jobs)
+// all hit Anthropic simultaneously and exhaust the TPM bucket.
+//
+// Separate slots for foreground (live user queries) and background (batch ops):
+//   - Foreground: 4 concurrent slots  — fast, interactive
+//   - Background: 2 concurrent slots  — rate-limited, yield to foreground
+// Total max in-flight: 6  (well within Claude subscription limits)
+//
+// Callers signal priority via: X-Request-Priority: background
+// SmartAssist's runLLMBackground already sets this header automatically.
+
+const FOREGROUND_SLOTS = parseInt(process.env.PROXY_FOREGROUND_SLOTS || "4", 10);
+const BACKGROUND_SLOTS = parseInt(process.env.PROXY_BACKGROUND_SLOTS || "2", 10);
+
+class Semaphore {
+  private slots: number;
+  private queue: Array<() => void> = [];
+
+  constructor(slots: number) {
+    this.slots = slots;
+  }
+
+  acquire(): Promise<void> {
+    if (this.slots > 0) {
+      this.slots--;
+      return Promise.resolve();
+    }
+    return new Promise(resolve => this.queue.push(resolve));
+  }
+
+  release(): void {
+    const next = this.queue.shift();
+    if (next) {
+      next(); // pass slot directly to next waiter
+    } else {
+      this.slots++;
+    }
+  }
+
+  get waiting(): number { return this.queue.length; }
+  get active(): number { return (this.slots === 0 ? (FOREGROUND_SLOTS + BACKGROUND_SLOTS) : 0); }
+}
+
+const foregroundSem = new Semaphore(FOREGROUND_SLOTS);
+const backgroundSem = new Semaphore(BACKGROUND_SLOTS);
+
+async function withConcurrencyLimit<T>(isBackground: boolean, fn: () => Promise<T>): Promise<T> {
+  const sem = isBackground ? backgroundSem : foregroundSem;
+  await sem.acquire();
+  try {
+    return await fn();
+  } finally {
+    sem.release();
+  }
+}
 
 function readCredentialsFromKeychain(): OAuthCredentials | null {
   // Production: read from env vars (Cloud Run / Secret Manager)
@@ -583,7 +644,10 @@ const server = Bun.serve({
       const originalModel = body.model;
       const anthropicBody = convertOpenAIToAnthropic(body);
 
-      console.log(`[proxy] ${originalModel} → ${anthropicBody.model} | stream=${!!body.stream}`);
+      // Detect background priority — set by runLLMBackground in SmartAssist
+      const isBackground = req.headers.get("x-request-priority") === "background";
+
+      console.log(`[proxy] ${originalModel} → ${anthropicBody.model} | stream=${!!body.stream} | priority=${isBackground ? "background" : "foreground"} | fg_waiting=${foregroundSem.waiting} bg_waiting=${backgroundSem.waiting}`);
 
       const headers = {
         "Authorization": `Bearer ${token}`,
@@ -592,10 +656,14 @@ const server = Bun.serve({
         "anthropic-beta": OAUTH_BETA,
       };
 
-      // Gap fix #3: use retry wrapper
-      const upstream = await fetchWithRetry(
-        `${ANTHROPIC_API}/v1/messages`,
-        { method: "POST", headers, body: JSON.stringify(anthropicBody) },
+      // Gap fix #5: concurrency limiter — serialises requests to Anthropic,
+      // same way multiple terminals share a single proxy without colliding.
+      // Background calls get fewer slots so they yield to foreground queries.
+      const upstream = await withConcurrencyLimit(isBackground, () =>
+        fetchWithRetry(
+          `${ANTHROPIC_API}/v1/messages`,
+          { method: "POST", headers, body: JSON.stringify(anthropicBody) },
+        )
       );
 
       if (!upstream.ok) {
