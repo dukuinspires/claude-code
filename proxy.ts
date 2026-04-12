@@ -44,27 +44,35 @@ let _consecutiveAuthFailures = 0;
 const AUTH_FAILURE_ALERT_THRESHOLD = 3;
 
 // ─── Concurrency limiter ─────────────────────────────────────────────────────
-// Mirrors how the a1 proxy serialises requests from multiple terminals via
-// localhost:3099. Without this, batch background calls (enrichment, queue jobs)
-// all hit Anthropic simultaneously and exhaust the TPM bucket.
+// 3-tier priority system — mirrors how Claude Code terminals share the proxy
+// without blocking each other, while protecting the TPM budget from batch jobs.
 //
-// Separate slots for foreground (live user queries) and background (batch ops):
-//   - Foreground: 4 concurrent slots  — fast, interactive
-//   - Background: 2 concurrent slots  — rate-limited, yield to foreground
-// Total max in-flight: 6  (well within Claude subscription limits)
+//   foreground      — live MAI chat queries. No semaphore. Let them through
+//                     concurrently just like Claude Code terminals do. These are
+//                     human-paced so they won't burst the limit.
 //
-// Callers signal priority via: X-Request-Priority: background
-// SmartAssist's runLLMBackground already sets this header automatically.
+//   background-high — time-sensitive queue jobs: reply engine, inbound contact
+//                     processing, calendar actions. 4 concurrent slots. A reply
+//                     arriving while enrichment runs won't wait.
+//
+//   background-low  — bulk batch work: enrichment, brain generation, gameplan
+//                     upgrades. 2 concurrent slots. Bails on 429 immediately
+//                     instead of retrying, so they never starve higher tiers.
+//
+// Callers signal tier via: X-Request-Priority: foreground | background-high | background-low
+// SmartAssist's runLLMBackground / runLLMBackgroundHigh set this automatically.
 
-const FOREGROUND_SLOTS = parseInt(process.env.PROXY_FOREGROUND_SLOTS || "4", 10);
-const BACKGROUND_SLOTS = parseInt(process.env.PROXY_BACKGROUND_SLOTS || "2", 10);
+const BG_HIGH_SLOTS = parseInt(process.env.PROXY_BG_HIGH_SLOTS || "4", 10);
+const BG_LOW_SLOTS  = parseInt(process.env.PROXY_BG_LOW_SLOTS  || "2", 10);
 
 class Semaphore {
   private slots: number;
+  private readonly maxSlots: number;
   private queue: Array<() => void> = [];
 
   constructor(slots: number) {
     this.slots = slots;
+    this.maxSlots = slots;
   }
 
   acquire(): Promise<void> {
@@ -78,21 +86,27 @@ class Semaphore {
   release(): void {
     const next = this.queue.shift();
     if (next) {
-      next(); // pass slot directly to next waiter
+      next();
     } else {
       this.slots++;
     }
   }
 
   get waiting(): number { return this.queue.length; }
-  get active(): number { return (this.slots === 0 ? (FOREGROUND_SLOTS + BACKGROUND_SLOTS) : 0); }
+  get inFlight(): number { return this.maxSlots - this.slots; }
 }
 
-const foregroundSem = new Semaphore(FOREGROUND_SLOTS);
-const backgroundSem = new Semaphore(BACKGROUND_SLOTS);
+const bgHighSem = new Semaphore(BG_HIGH_SLOTS);
+const bgLowSem  = new Semaphore(BG_LOW_SLOTS);
 
-async function withConcurrencyLimit<T>(isBackground: boolean, fn: () => Promise<T>): Promise<T> {
-  const sem = isBackground ? backgroundSem : foregroundSem;
+type RequestPriority = "foreground" | "background-high" | "background-low";
+
+async function withConcurrencyLimit<T>(priority: RequestPriority, fn: () => Promise<T>): Promise<T> {
+  if (priority === "foreground") {
+    // No semaphore — foreground requests pass straight through like Claude Code terminals
+    return fn();
+  }
+  const sem = priority === "background-high" ? bgHighSem : bgLowSem;
   await sem.acquire();
   try {
     return await fn();
@@ -644,10 +658,15 @@ const server = Bun.serve({
       const originalModel = body.model;
       const anthropicBody = convertOpenAIToAnthropic(body);
 
-      // Detect background priority — set by runLLMBackground in SmartAssist
-      const isBackground = req.headers.get("x-request-priority") === "background";
+      // Detect request priority — set by runLLM / runLLMBackgroundHigh / runLLMBackground
+      const priorityHeader = req.headers.get("x-request-priority") || "foreground";
+      const priority: RequestPriority =
+        priorityHeader === "background-high" ? "background-high" :
+        priorityHeader === "background-low"  ? "background-low"  :
+        priorityHeader === "background"      ? "background-low"  : // legacy compat
+        "foreground";
 
-      console.log(`[proxy] ${originalModel} → ${anthropicBody.model} | stream=${!!body.stream} | priority=${isBackground ? "background" : "foreground"} | fg_waiting=${foregroundSem.waiting} bg_waiting=${backgroundSem.waiting}`);
+      console.log(`[proxy] ${originalModel} → ${anthropicBody.model} | stream=${!!body.stream} | priority=${priority} | bgh_inflight=${bgHighSem.inFlight}/${BG_HIGH_SLOTS} bgl_inflight=${bgLowSem.inFlight}/${BG_LOW_SLOTS}`);
 
       const headers = {
         "Authorization": `Bearer ${token}`,
@@ -656,10 +675,11 @@ const server = Bun.serve({
         "anthropic-beta": OAUTH_BETA,
       };
 
-      // Gap fix #5: concurrency limiter — serialises requests to Anthropic,
-      // same way multiple terminals share a single proxy without colliding.
-      // Background calls get fewer slots so they yield to foreground queries.
-      const upstream = await withConcurrencyLimit(isBackground, () =>
+      // Gap fix #5: concurrency limiter — 3-tier priority.
+      // Foreground: no semaphore (pass-through like Claude Code terminals).
+      // background-high: 4 slots (reply engine, inbound — time-sensitive).
+      // background-low: 2 slots (enrichment, batch — yield to everything else).
+      const upstream = await withConcurrencyLimit(priority, () =>
         fetchWithRetry(
           `${ANTHROPIC_API}/v1/messages`,
           { method: "POST", headers, body: JSON.stringify(anthropicBody) },
