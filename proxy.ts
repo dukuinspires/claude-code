@@ -215,16 +215,16 @@ async function getAccessToken(): Promise<string | null> {
 // ─── Model mapping ───────────────────────────────────────────────────────────
 
 const MODEL_MAP: Record<string, string> = {
-  // OpenAI models → Claude equivalents (all → Sonnet 4.6)
-  "gpt-4o":             "claude-sonnet-4-6",
-  "gpt-4o-mini":        "claude-sonnet-4-6",
+  // OpenAI models → Claude equivalents
+  "gpt-4o":             "claude-sonnet-4-6",   // main model → Sonnet
+  "gpt-4o-mini":        "claude-haiku-4-5-20251001",  // lightweight → Haiku (higher TPM, real fallback)
   "gpt-4":              "claude-sonnet-4-6",
-  "gpt-3.5-turbo":      "claude-sonnet-4-6",
-  // DeepSeek models → Claude equivalents (all → Sonnet 4.6)
-  "deepseek-chat":               "claude-sonnet-4-6",
-  "deepseek-v3":                 "claude-sonnet-4-6",
+  "gpt-3.5-turbo":      "claude-haiku-4-5-20251001",
+  // DeepSeek models → Haiku (used as fallback bucket — different TPM limit from Sonnet)
+  "deepseek-chat":               "claude-haiku-4-5-20251001",
+  "deepseek-v3":                 "claude-haiku-4-5-20251001",
   "deepseek-reasoner":           "claude-sonnet-4-6",
-  "deepseek/deepseek-chat":      "claude-sonnet-4-6",
+  "deepseek/deepseek-chat":      "claude-haiku-4-5-20251001",
   "deepseek/deepseek-reasoner":  "claude-sonnet-4-6",
   // Claude models → pass through as-is
   "claude-sonnet-4-6":           "claude-sonnet-4-6",
@@ -240,7 +240,7 @@ const MODEL_MAP: Record<string, string> = {
 };
 
 function mapModel(model: string): string {
-  return MODEL_MAP[model] || "claude-sonnet-4-6";
+  return MODEL_MAP[model] || "claude-haiku-4-5-20251001";
 }
 
 // ─── Format conversion ───────────────────────────────────────────────────────
@@ -342,7 +342,10 @@ function convertOpenAIToAnthropic(body: any): any {
 
   return {
     model: mapModel(body.model),
-    max_tokens: body.max_tokens || 8096,
+    // Default 1024 — callers that need more must set max_tokens explicitly.
+    // The old 8096 default caused every unspecified call to reserve a full 8k
+    // output slot, eating TPM budget even for simple classification tasks.
+    max_tokens: body.max_tokens || 1024,
     ...(system && { system }),
     messages: convertMessagesToAnthropic(messages),
     ...(tools.length && { tools }),
@@ -739,7 +742,7 @@ console.log(`
 ║  Base URL: http://localhost:${PORT}/v1                  ║
 ║  Auth:    Claude subscription (keychain/env)         ║
 ║  Models:  gpt-4o → claude-sonnet-4-6                 ║
-║           gpt-4o-mini → claude-sonnet-4-6            ║
+║           gpt-4o-mini → claude-haiku-4-5             ║
 ║  Fallback: OpenAI direct (if OPENAI_API_KEY set)     ║
 ╚══════════════════════════════════════════════════════╝
 `);
