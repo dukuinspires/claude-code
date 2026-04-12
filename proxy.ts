@@ -101,13 +101,22 @@ const bgLowSem  = new Semaphore(BG_LOW_SLOTS);
 
 type RequestPriority = "foreground" | "background-high" | "background-low";
 
-async function withConcurrencyLimit<T>(priority: RequestPriority, fn: () => Promise<T>): Promise<T> {
+async function withConcurrencyLimit<T>(priority: RequestPriority, fn: () => Promise<T>, label?: string): Promise<T> {
   if (priority === "foreground") {
-    // No semaphore — foreground requests pass straight through like Claude Code terminals
     return fn();
   }
   const sem = priority === "background-high" ? bgHighSem : bgLowSem;
+  const maxSlots = priority === "background-high" ? BG_HIGH_SLOTS : BG_LOW_SLOTS;
+  const wasQueued = sem.inFlight >= maxSlots;
+  if (wasQueued) {
+    console.log(`[proxy] ⏳ QUEUED ${label || ""} | priority=${priority} | waiting=${sem.waiting + 1} | inflight=${sem.inFlight}/${maxSlots}`);
+  }
+  const waitStart = Date.now();
   await sem.acquire();
+  const waitMs = Date.now() - waitStart;
+  if (waitMs > 50) {
+    console.log(`[proxy] ▶ DEQUEUED ${label || ""} | priority=${priority} | waited=${waitMs}ms | inflight=${sem.inFlight}/${maxSlots}`);
+  }
   try {
     return await fn();
   } finally {
@@ -292,9 +301,12 @@ async function getAccessToken(): Promise<string | null> {
 const MODEL_MAP: Record<string, string> = {
   // OpenAI models → Claude equivalents
   "gpt-4o":             "claude-sonnet-4-6",   // main model → Sonnet
-  "gpt-4o-mini":        "claude-haiku-4-5-20251001",  // lightweight → Haiku (higher TPM, real fallback)
+  "gpt-4o-mini":        "claude-haiku-4-5-20251001",  // lightweight → Haiku
   "gpt-4":              "claude-sonnet-4-6",
   "gpt-3.5-turbo":      "claude-haiku-4-5-20251001",
+  // subscription/* variants (used by internal runLLM routing)
+  "subscription/gpt-4o":       "claude-sonnet-4-6",
+  "subscription/gpt-4o-mini":  "claude-haiku-4-5-20251001",
   // DeepSeek models → Haiku (used as fallback bucket — different TPM limit from Sonnet)
   "deepseek-chat":               "claude-haiku-4-5-20251001",
   "deepseek-v3":                 "claude-haiku-4-5-20251001",
@@ -504,8 +516,10 @@ async function fetchWithRetry(
 
     // Parse retry-after header or use exponential backoff
     const retryAfter = res.headers.get("retry-after");
+    const rlTokRemaining = res.headers.get("anthropic-ratelimit-tokens-remaining");
+    const rlReqRemaining = res.headers.get("anthropic-ratelimit-requests-remaining");
     const waitMs = retryAfter ? parseInt(retryAfter) * 1000 : (1000 * Math.pow(2, i));
-    console.warn(`[proxy] Rate limited (429), retrying in ${waitMs}ms (attempt ${i + 1}/${maxAttempts})`);
+    console.warn(`[proxy] ⚠ 429 retry-after=${retryAfter ?? "none"} tok_remaining=${rlTokRemaining ?? "?"} req_remaining=${rlReqRemaining ?? "?"} | waiting ${waitMs}ms (attempt ${i + 1}/${maxAttempts})`);
     await sleep(waitMs);
 
     // Re-fetch fresh token on retry (may have been refreshed)
@@ -666,7 +680,8 @@ const server = Bun.serve({
         priorityHeader === "background"      ? "background-low"  : // legacy compat
         "foreground";
 
-      console.log(`[proxy] ${originalModel} → ${anthropicBody.model} | stream=${!!body.stream} | priority=${priority} | bgh_inflight=${bgHighSem.inFlight}/${BG_HIGH_SLOTS} bgl_inflight=${bgLowSem.inFlight}/${BG_LOW_SLOTS}`);
+      const reqLabel = `${originalModel}→${anthropicBody.model}`;
+      console.log(`[proxy] ▸ REQ ${reqLabel} | stream=${!!body.stream} | priority=${priority} | bgh=${bgHighSem.inFlight}/${BG_HIGH_SLOTS}(q=${bgHighSem.waiting}) bgl=${bgLowSem.inFlight}/${BG_LOW_SLOTS}(q=${bgLowSem.waiting})`);
 
       const headers = {
         "Authorization": `Bearer ${token}`,
@@ -674,6 +689,8 @@ const server = Bun.serve({
         "anthropic-version": ANTHROPIC_VERSION,
         "anthropic-beta": OAUTH_BETA,
       };
+
+      const reqStart = Date.now();
 
       // Gap fix #5: concurrency limiter — 3-tier priority.
       // Foreground: no semaphore (pass-through like Claude Code terminals).
@@ -683,12 +700,26 @@ const server = Bun.serve({
         fetchWithRetry(
           `${ANTHROPIC_API}/v1/messages`,
           { method: "POST", headers, body: JSON.stringify(anthropicBody) },
-        )
+        ),
+        reqLabel,
       );
+
+      const upstreamMs = Date.now() - reqStart;
+
+      // Log rate limit headers from Anthropic on every response
+      const rlReqLimit     = upstream.headers.get("anthropic-ratelimit-requests-limit");
+      const rlReqRemaining = upstream.headers.get("anthropic-ratelimit-requests-remaining");
+      const rlReqReset     = upstream.headers.get("anthropic-ratelimit-requests-reset");
+      const rlTokLimit     = upstream.headers.get("anthropic-ratelimit-tokens-limit");
+      const rlTokRemaining = upstream.headers.get("anthropic-ratelimit-tokens-remaining");
+      const rlTokReset     = upstream.headers.get("anthropic-ratelimit-tokens-reset");
+      if (rlReqLimit || rlTokLimit) {
+        console.log(`[proxy] RL req=${rlReqRemaining}/${rlReqLimit}(rst=${rlReqReset}) tok=${rlTokRemaining}/${rlTokLimit}(rst=${rlTokReset}) | ${upstreamMs}ms`);
+      }
 
       if (!upstream.ok) {
         const errText = await upstream.text();
-        console.error(`[proxy] Upstream error ${upstream.status}:`, errText.slice(0, 300));
+        console.error(`[proxy] ✗ ${upstream.status} ${reqLabel} | ${upstreamMs}ms |`, errText.slice(0, 300));
 
         // Gap fix #1: track auth failures
         if (upstream.status === 401) {
@@ -730,6 +761,7 @@ const server = Bun.serve({
 
             // Track active tool_use blocks across stream events
             const toolBlocks: Record<number, { id: string; name: string; inputJson: string }> = {};
+            let streamUsage: { input_tokens?: number; output_tokens?: number } = {};
 
             function emit(chunk: any) {
               controller.enqueue(enc.encode(`data: ${JSON.stringify(chunk)}\n\n`));
@@ -784,15 +816,23 @@ const server = Bun.serve({
                     }
                   }
 
-                  // Message stop
+                  // Message stop — capture usage from message_delta
                   else if (event.type === "message_delta" && event.delta?.stop_reason) {
+                    if (event.usage) streamUsage = event.usage;
                     const stopReason = event.delta.stop_reason;
                     const finishReason = stopReason === "tool_use" ? "tool_calls" : "stop";
                     emit(baseChunk({ choices: [{ index: 0, delta: {}, finish_reason: finishReason }] }));
                     controller.enqueue(enc.encode("data: [DONE]\n\n"));
                   }
 
+                  // message_start contains input token count
+                  else if (event.type === "message_start" && event.message?.usage) {
+                    streamUsage = { ...streamUsage, input_tokens: event.message.usage.input_tokens };
+                  }
+
                   else if (event.type === "message_stop") {
+                    const totalMs = Date.now() - reqStart;
+                    console.log(`[proxy] ✓ stream ${reqLabel} | ${totalMs}ms | in=${streamUsage.input_tokens ?? "?"} out=${streamUsage.output_tokens ?? "?"}`);
                     emit(baseChunk({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }));
                     controller.enqueue(enc.encode("data: [DONE]\n\n"));
                   }
@@ -814,6 +854,12 @@ const server = Bun.serve({
 
       // Non-streaming
       const anthropicResponse = await upstream.json() as any;
+      const usage = anthropicResponse?.usage;
+      if (usage) {
+        console.log(`[proxy] ✓ ${reqLabel} | ${upstreamMs}ms | in=${usage.input_tokens} out=${usage.output_tokens} cache_read=${usage.cache_read_input_tokens ?? 0} cache_write=${usage.cache_creation_input_tokens ?? 0}`);
+      } else {
+        console.log(`[proxy] ✓ ${reqLabel} | ${upstreamMs}ms`);
+      }
       const openAIResponse = convertAnthropicToOpenAI(anthropicResponse, originalModel);
       return Response.json(openAIResponse);
     }
