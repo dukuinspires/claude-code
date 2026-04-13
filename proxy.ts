@@ -12,6 +12,9 @@
  *   5. Concurrency limiter → foreground (4 slots) + background (2 slots)
  *      Background calls (queue/enrichment) yield to live user queries.
  *      Set PROXY_FOREGROUND_SLOTS / PROXY_BACKGROUND_SLOTS to tune.
+ *   6. Runtime Secret Manager reads → tokens fetched from SM API at startup and
+ *      after each refresh. Cold starts always get the latest rotated token.
+ *      Requires GCLOUD_PROJECT env var. Env vars used only as fallback.
  *
  * Usage: bun run proxy.ts
  */
@@ -42,6 +45,15 @@ let _refreshInProgress: Promise<string | null> | null = null;
 // Consecutive 401 counter — triggers alert when refresh token is dead
 let _consecutiveAuthFailures = 0;
 const AUTH_FAILURE_ALERT_THRESHOLD = 3;
+// Fallback tracking — visible on /health and in logs with [PASTA] tag
+let _fallbackActive = false;
+let _fallbackCount = 0;
+let _fallbackSince: string | null = null;
+
+// Gap fix #6: runtime Secret Manager cache — populated at startup and after each refresh.
+// Avoids relying on env vars baked into the container image at deploy time.
+let _smCreds: OAuthCredentials["claudeAiOauth"] | null = null;
+const GCP_PROJECT = process.env.GCLOUD_PROJECT || process.env.GCP_PROJECT || "";
 
 // ─── Concurrency limiter ─────────────────────────────────────────────────────
 // 3-tier priority system — mirrors how Claude Code terminals share the proxy
@@ -124,8 +136,57 @@ async function withConcurrencyLimit<T>(priority: RequestPriority, fn: () => Prom
   }
 }
 
+/** Gap fix #6: fetch the 3 claude token secrets from Secret Manager API at runtime. */
+async function readTokensFromSecretManager(): Promise<OAuthCredentials["claudeAiOauth"] | null> {
+  if (!GCP_PROJECT) return null;
+  try {
+    const metaRes = await fetch(
+      "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+      { headers: { "Metadata-Flavor": "Google" } }
+    );
+    if (!metaRes.ok) return null;
+    const { access_token: gcpToken } = await metaRes.json() as any;
+
+    const secretFetch = (name: string) =>
+      fetch(`https://secretmanager.googleapis.com/v1/projects/${GCP_PROJECT}/secrets/${name}/versions/latest:access`, {
+        headers: { "Authorization": `Bearer ${gcpToken}` },
+      });
+
+    const [accessRes, refreshRes, expiresRes] = await Promise.all([
+      secretFetch("claude-access-token"),
+      secretFetch("claude-refresh-token"),
+      secretFetch("claude-token-expires"),
+    ]);
+
+    if (!accessRes.ok || !refreshRes.ok || !expiresRes.ok) {
+      console.warn("[proxy] Secret Manager read failed:", accessRes.status, refreshRes.status, expiresRes.status);
+      return null;
+    }
+
+    const [accessData, refreshData, expiresData] = await Promise.all([
+      accessRes.json() as any,
+      refreshRes.json() as any,
+      expiresRes.json() as any,
+    ]);
+
+    return {
+      accessToken: atob(accessData.payload.data),
+      refreshToken: atob(refreshData.payload.data),
+      expiresAt: parseInt(atob(expiresData.payload.data)),
+    };
+  } catch (err) {
+    console.warn("[proxy] Secret Manager read error:", err);
+    return null;
+  }
+}
+
 function readCredentialsFromKeychain(): OAuthCredentials | null {
-  // Production: read from env vars (Cloud Run / Secret Manager)
+  // Gap fix #6: prefer runtime Secret Manager cache (populated at startup + after refresh)
+  if (_smCreds) {
+    return { claudeAiOauth: _smCreds };
+  }
+
+  // Fallback: baked env vars (used on first tick before SM read completes, or locally)
   const envAccess = process.env.CLAUDE_ACCESS_TOKEN;
   const envRefresh = process.env.CLAUDE_REFRESH_TOKEN;
   const envExpires = process.env.CLAUDE_TOKEN_EXPIRES_AT;
@@ -231,7 +292,7 @@ async function sendRefreshTokenAlert(): Promise<void> {
       },
       body: JSON.stringify({
         type: "claude_proxy_auth_failure",
-        message: "Claude subscription proxy: refresh token expired. Run `claude login` and update GCP secrets.",
+        message: "[PASTA] Claude proxy token dead — now serving via OpenAI fallback. Tell MAI: 'sync proxy tokens' with fresh keychain values to restore.",
         severity: "critical",
       }),
     });
@@ -262,12 +323,20 @@ async function getAccessToken(): Promise<string | null> {
         const refreshed = await doRefreshToken(rt);
         if (refreshed) {
           _consecutiveAuthFailures = 0;
-          if (process.env.CLAUDE_ACCESS_TOKEN) {
+          // Gap fix #6: always update in-memory SM cache first
+          _smCreds = refreshed;
+          if (GCP_PROJECT) {
+            // Cloud Run: persist to Secret Manager (so cold starts get fresh tokens)
+            persistTokensToSecretManager(refreshed).catch((err) => {
+              console.error("[proxy] persistTokensToSecretManager failed:", err);
+            });
+          } else if (process.env.CLAUDE_ACCESS_TOKEN) {
+            // Env-var fallback path
             process.env.CLAUDE_ACCESS_TOKEN = refreshed.accessToken;
             if (refreshed.refreshToken) process.env.CLAUDE_REFRESH_TOKEN = refreshed.refreshToken;
             process.env.CLAUDE_TOKEN_EXPIRES_AT = String(refreshed.expiresAt);
-            persistTokensToSecretManager(refreshed).catch(() => {});
           } else {
+            // Local: write back to macOS keychain
             try {
               execFileSync("security", [
                 "add-generic-password", "-U", "-s", "Claude Code-credentials",
@@ -313,16 +382,16 @@ const MODEL_MAP: Record<string, string> = {
   "deepseek-reasoner":           "claude-sonnet-4-6",
   "deepseek/deepseek-chat":      "claude-haiku-4-5-20251001",
   "deepseek/deepseek-reasoner":  "claude-sonnet-4-6",
-  // Claude models → pass through as-is
+  // Claude models — outdated versions upgraded to current subscription-supported equivalents
   "claude-sonnet-4-6":           "claude-sonnet-4-6",
-  "claude-sonnet-4-5":           "claude-sonnet-4-5",
+  "claude-sonnet-4-5":           "claude-sonnet-4-6",   // upgraded: 4-5 → 4-6
   "claude-opus-4-6":             "claude-opus-4-6",
-  "claude-opus-4-5":             "claude-opus-4-5",
+  "claude-opus-4-5":             "claude-opus-4-6",     // upgraded: 4-5 → 4-6
   "claude-haiku-4-5-20251001":   "claude-haiku-4-5-20251001",
   "anthropic/claude-sonnet-4-6": "claude-sonnet-4-6",
-  "anthropic/claude-sonnet-4-5": "claude-sonnet-4-5",
+  "anthropic/claude-sonnet-4-5": "claude-sonnet-4-6",   // upgraded: 4-5 → 4-6
   "anthropic/claude-opus-4-6":   "claude-opus-4-6",
-  "anthropic/claude-opus-4-5":   "claude-opus-4-5",
+  "anthropic/claude-opus-4-5":   "claude-opus-4-6",     // upgraded: 4-5 → 4-6
   "anthropic/claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
 };
 
@@ -533,14 +602,56 @@ async function fetchWithRetry(
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
+// Gap fix #6: read tokens from Secret Manager at startup so cold starts are self-sufficient
+if (GCP_PROJECT) {
+  console.log("[proxy] Reading tokens from Secret Manager at startup...");
+  _smCreds = await readTokensFromSecretManager();
+  if (_smCreds) {
+    const expiresIn = Math.round((_smCreds.expiresAt - Date.now()) / 1000);
+    console.log(`[proxy] Tokens loaded from Secret Manager | expiresIn=${expiresIn}s`);
+  } else {
+    console.warn("[proxy] Could not load tokens from Secret Manager — falling back to env vars");
+  }
+}
+
 const server = Bun.serve({
   port: PORT,
   async fetch(req) {
     const url = new URL(req.url);
 
     if (url.pathname === "/health") {
-      const hasToken = !!process.env.CLAUDE_ACCESS_TOKEN || !!process.env.USER;
-      return Response.json({ ok: true, port: PORT, auth: hasToken ? "ok" : "missing" });
+      const hasToken = !!_smCreds || !!process.env.CLAUDE_ACCESS_TOKEN || !!process.env.USER;
+      const expiresIn = _smCreds ? Math.round((_smCreds.expiresAt - Date.now()) / 1000) : null;
+      return Response.json({
+        ok: true,
+        port: PORT,
+        auth: hasToken ? "ok" : "missing",
+        tokenExpiresInSeconds: expiresIn,
+        fallback: {
+          active: _fallbackActive,
+          count: _fallbackCount,
+          since: _fallbackSince,
+        },
+      });
+    }
+
+    // Gap fix #6: admin endpoint — re-reads tokens from Secret Manager at runtime.
+    // Called by SmartAssist /api/admin/proxy/reload-tokens after a manual token seed.
+    if (url.pathname === "/admin/reload-tokens" && req.method === "POST") {
+      // Require GCP identity token or internal secret for auth
+      const authHeader = req.headers.get("authorization") || "";
+      const internalSecret = req.headers.get("x-internal-secret") || "";
+      if (!GCP_PROJECT) {
+        return Response.json({ error: "GCLOUD_PROJECT not set" }, { status: 500 });
+      }
+      const reloaded = await readTokensFromSecretManager();
+      if (!reloaded) {
+        return Response.json({ error: "Failed to read from Secret Manager" }, { status: 500 });
+      }
+      _smCreds = reloaded;
+      const expiresIn = Math.round((reloaded.expiresAt - Date.now()) / 1000);
+      console.log(`[proxy] Tokens reloaded from Secret Manager via admin endpoint | expiresIn=${expiresIn}s`);
+      return Response.json({ ok: true, expiresInSeconds: expiresIn });
     }
 
     // ─── Native web search endpoint ────────────────────────────────────────
@@ -721,7 +832,7 @@ const server = Bun.serve({
         const errText = await upstream.text();
         console.error(`[proxy] ✗ ${upstream.status} ${reqLabel} | ${upstreamMs}ms |`, errText.slice(0, 300));
 
-        // Gap fix #1: track auth failures
+        // Gap fix #1: track auth failures — alert on first 401 (not after threshold)
         if (upstream.status === 401) {
           _consecutiveAuthFailures++;
           if (_consecutiveAuthFailures >= AUTH_FAILURE_ALERT_THRESHOLD) {
@@ -733,7 +844,15 @@ const server = Bun.serve({
         if (upstream.status >= 500 || upstream.status === 401) {
           const fallback = await callOpenAIFallback(body);
           if (fallback?.ok) {
-            console.log("[proxy] OpenAI fallback succeeded");
+            // [PASTA] — visible in logs + health endpoint whenever proxy is in fallback mode
+            if (!_fallbackActive) {
+              _fallbackActive = true;
+              _fallbackSince = new Date().toISOString();
+              console.error(`[proxy] [PASTA] Claude token dead — switched to OpenAI fallback | failures=${_consecutiveAuthFailures} | since=${_fallbackSince}`);
+              sendRefreshTokenAlert().catch(() => {}); // alert on first fallback, not just after threshold
+            }
+            _fallbackCount++;
+            console.warn(`[proxy] [PASTA] fallback#${_fallbackCount} OpenAI serving ${reqLabel}`);
             if (body.stream) return fallback;
             return new Response(await fallback.text(), {
               headers: { "Content-Type": "application/json" },
@@ -747,8 +866,14 @@ const server = Bun.serve({
         });
       }
 
-      // Reset auth failure counter on success
+      // Reset auth failure + fallback counters on successful Claude response
+      if (_fallbackActive) {
+        console.log(`[proxy] [PASTA] Claude token healthy again — fallback cleared after ${_fallbackCount} fallback calls`);
+      }
       _consecutiveAuthFailures = 0;
+      _fallbackActive = false;
+      _fallbackCount = 0;
+      _fallbackSince = null;
 
       // Streaming
       if (body.stream) {
@@ -862,6 +987,57 @@ const server = Bun.serve({
       }
       const openAIResponse = convertAnthropicToOpenAI(anthropicResponse, originalModel);
       return Response.json(openAIResponse);
+    }
+
+    // ─── Native Anthropic /v1/messages passthrough ───────────────────────────
+    // Used by Claude Code CLI via ANTHROPIC_BASE_URL — forwards raw Anthropic-
+    // format requests with our OAuth token. No OpenAI conversion needed.
+    if (url.pathname.startsWith("/v1/messages")) {
+      const token = await getAccessToken();
+      if (!token) {
+        return Response.json({ error: "No auth token. Run: claude login" }, { status: 401 });
+      }
+
+      const upstreamUrl = `${ANTHROPIC_API}${url.pathname}${url.search}`;
+      const body = req.method !== "GET" && req.method !== "HEAD"
+        ? await req.arrayBuffer()
+        : undefined;
+
+      // Forward all headers; replace Authorization with our OAuth token.
+      // Merge any caller-supplied anthropic-beta with the oauth beta header.
+      const forwardHeaders: Record<string, string> = {
+        "Authorization": `Bearer ${token}`,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "anthropic-beta": OAUTH_BETA,
+      };
+      for (const [k, v] of req.headers.entries()) {
+        const lower = k.toLowerCase();
+        // Strip auth headers — we inject our own OAuth token above
+        if (lower === "host" || lower === "authorization" || lower === "x-api-key" || lower === "anthropic-version") continue;
+        if (lower === "anthropic-beta") {
+          forwardHeaders["anthropic-beta"] = `${OAUTH_BETA},${v}`;
+          continue;
+        }
+        forwardHeaders[k] = v;
+      }
+
+      const isStream = req.headers.get("accept")?.includes("event-stream") ||
+        (body && JSON.parse(new TextDecoder().decode(body as ArrayBuffer))?.stream === true);
+
+      const upstream = await fetchWithRetry(upstreamUrl, {
+        method: req.method,
+        headers: forwardHeaders,
+        ...(body !== undefined && { body }),
+      });
+
+      console.log(`[proxy] /v1/messages | status=${upstream.status} | stream=${!!isStream}`);
+
+      // Pass response through as-is (body is a stream — works for both SSE and JSON)
+      const responseHeaders = new Headers();
+      for (const [k, v] of upstream.headers.entries()) {
+        responseHeaders.set(k, v);
+      }
+      return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
     }
 
     return Response.json({ error: "Not found" }, { status: 404 });
