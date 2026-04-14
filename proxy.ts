@@ -26,6 +26,9 @@ const ANTHROPIC_API = "https://api.anthropic.com";
 const ANTHROPIC_VERSION = "2023-06-01";
 const OAUTH_BETA = "oauth-2025-04-20";
 const OPENAI_FALLBACK_KEY = process.env.OPENAI_API_KEY || "";
+const DEEPSEEK_FALLBACK_KEY = process.env.DEEPSEEK_API_KEY || "";
+const DEEPSEEK_API_URL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
+const DEEPSEEK_MODELS = new Set(["deepseek-chat", "deepseek-reasoner", "deepseek-v3", "deepseek-coder"]);
 const SMARTASSIST_URL = process.env.SMARTASSIST_URL || "";
 const SMARTASSIST_INTERNAL_SECRET = process.env.SMARTASSIST_INTERNAL_SECRET || "";
 
@@ -576,7 +579,7 @@ function convertAnthropicToOpenAI(anthropicResponse: any, model: string): any {
   };
 }
 
-// ─── Gap fix #2: OpenAI fallback ─────────────────────────────────────────────
+// ─── Gap fix #2: provider fallbacks ──────────────────────────────────────────
 
 async function callOpenAIFallback(body: any): Promise<Response | null> {
   if (!OPENAI_FALLBACK_KEY) return null;
@@ -586,6 +589,26 @@ async function callOpenAIFallback(body: any): Promise<Response | null> {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${OPENAI_FALLBACK_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    return res;
+  } catch {
+    return null;
+  }
+}
+
+// DeepSeek fallback — used when the original model is a DeepSeek model.
+// OpenAI doesn't recognise "deepseek-chat" etc, so we route to DeepSeek's own API.
+async function callDeepSeekFallback(body: any): Promise<Response | null> {
+  if (!DEEPSEEK_FALLBACK_KEY) return null;
+  console.warn("[proxy] ⚡ Falling back to DeepSeek direct");
+  try {
+    const res = await fetch(`${DEEPSEEK_API_URL}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${DEEPSEEK_FALLBACK_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
@@ -869,19 +892,26 @@ const server = Bun.serve({
           }
         }
 
-        // Gap fix #2: fallback to OpenAI on Claude failure
+        // Gap fix #2: fallback on Claude failure
+        // Route to DeepSeek if the original model is a DeepSeek model — OpenAI
+        // doesn't recognise "deepseek-chat" etc and would return invalid_issuer.
         if (upstream.status >= 500 || upstream.status === 401) {
-          const fallback = await callOpenAIFallback(body);
+          const isDeepSeekModel = DEEPSEEK_MODELS.has(originalModel);
+          const fallback = isDeepSeekModel
+            ? await callDeepSeekFallback(body)
+            : await callOpenAIFallback(body);
           if (fallback?.ok) {
             // [PASTA] — visible in logs + health endpoint whenever proxy is in fallback mode
             if (!_fallbackActive) {
               _fallbackActive = true;
               _fallbackSince = new Date().toISOString();
-              console.error(`[proxy] [PASTA] Claude token dead — switched to OpenAI fallback | failures=${_consecutiveAuthFailures} | since=${_fallbackSince}`);
+              const dest = isDeepSeekModel ? "DeepSeek" : "OpenAI";
+              console.error(`[proxy] [PASTA] Claude token dead — switched to ${dest} fallback | failures=${_consecutiveAuthFailures} | since=${_fallbackSince}`);
               sendRefreshTokenAlert().catch(() => {}); // alert on first fallback, not just after threshold
             }
             _fallbackCount++;
-            console.warn(`[proxy] [PASTA] fallback#${_fallbackCount} OpenAI serving ${reqLabel}`);
+            const dest = isDeepSeekModel ? "DeepSeek" : "OpenAI";
+            console.warn(`[proxy] [PASTA] fallback#${_fallbackCount} ${dest} serving ${reqLabel}`);
             if (body.stream) return fallback;
             return new Response(await fallback.text(), {
               headers: { "Content-Type": "application/json" },
