@@ -6,20 +6,6 @@
 
 ---
 
-## ⚠️ Important Disclaimer
-
-**I did not leak these files.** I have simply provided an easy, documented way to access and study this codebase for research purposes. All files and information originate from public findings shared on Twitter/X. All credit for the discovery goes to the original source.
-
----
-
-Earlier today (March 31st, 2026) - **Chaofan Shou (@Fried_rice)** discovered something that Anthropic probably didn't want the world to see: the **entire source code** of Claude Code, Anthropic's official AI coding CLI, was sitting in plain sight on the npm registry via a sourcemap file bundled into the published package.
-
-[![The tweet announcing the leak](assets/x-post.png)](https://x.com/Fried_rice/status/2038894956459290963)
-
-This repository is a backup of that leaked source, providing a full breakdown of what's in it, how the leak happened, and the internal systems that were never meant to be public.
-
----
-
 ## 🧐 How Did This Even Happen?
 
 When you publish a JavaScript/TypeScript package to npm, the build toolchain often generates **source map files** (`.map` files). These files bridge minified production code and the original source for debugging.
@@ -41,32 +27,70 @@ By forgetting to add `*.map` to `.npmignore` or failing to disable source maps i
 
 ---
 
-## 🛠 What's Under the Hood?
+## 🛠 Best Practices for Building AI-Powered CLI Systems
 
-Claude Code is not just a simple CLI. It's a massive **785KB `main.tsx`** entry point featuring a custom React terminal renderer (Ink), 40+ tools, and complex multi-agent orchestration.
+Instead of focusing on internal implementations, this section highlights **practical best practices** you can apply when building your own AI-powered CLI, agent framework, or developer tooling platform.
 
-### 🐣 BUDDY - The Terminal Tamagotchi
-Inside [`src/buddy/`](./src/buddy/), there is a full **Tamagotchi-style companion system**.
-- **Deterministic Gacha:** Uses a Mulberry32 PRNG seeded from your `userId`.
-- **18 Species:** Ranging from Common (*Pebblecrab*) to Legendary (*Nebulynx*).
-- **Stats & Souls:** Every buddy has stats like `DEBUGGING`, `CHAOS`, and `SNARK`, with a "soul" description written by Claude.
+### 🧠 Modular Agent Architecture
 
-### 🕵️‍♂️ Undercover Mode - "Do Not Blow Your Cover"
-Anthropic employees use Claude Code to contribute to public repos. **Undercover Mode** ([`src/utils/undercover.ts`](./src/utils/undercover.ts)) prevents the AI from leaking internal info:
-- Blocks internal model codenames (e.g., *Capybara*, *Tengu*).
-- Hides the fact that the user is an AI.
-- Confirms that **"Tengu"** is likely the internal codename for Claude Code.
+- Break your system into **independent, composable tools**
+- Use a shared interface (e.g. Tool base class) for consistency
+- Allow dynamic tool discovery and execution
+- Avoid tightly coupling logic into a single monolithic file
 
-### 🌙 The "Dream" System
-Claude Code "dreams" to consolidate memory. The **autoDream** service ([`src/services/autoDream/`](./src/services/autoDream/)) runs as a background subagent to:
-1. **Orient:** Read `MEMORY.md`.
-2. **Gather:** Find new signals from daily logs.
-3. **Consolidate:** Update durable memory files.
-4. **Prune:** Keep context efficient.
+### 🔁 Multi-Agent Orchestration
 
-### 🚀 KAIROS & ULTRAPLAN
-- **KAIROS:** An "always-on" proactive assistant that watches logs and acts without waiting for input.
-- **ULTRAPLAN:** Offloads complex tasks to a remote **Opus 4.6** session for up to 30 minutes of deep planning.
+- Separate responsibilities across agents (planner, executor, memory, etc.)
+- Use a coordinator layer to manage task delegation
+- Enable parallelism where possible for performance
+- Keep agents stateless where feasible, and persist state externally
+
+### 🧩 Tooling System Design
+
+- Build tools as reusable, isolated units (filesystem, web, code execution, etc.)
+- Standardise input/output schemas for reliability
+- Add validation and error handling at the tool level
+- Log all tool interactions for debugging and observability
+
+### 🧠 Memory & Context Management
+
+- Maintain both **short-term (session)** and **long-term (persistent)** memory
+- Regularly prune irrelevant or outdated context
+- Use summarisation to compress large histories efficiently
+- Store structured memory (not just raw text)
+
+### ⚙️ Background Processing & Automation
+
+- Run background jobs for memory consolidation, indexing, or analytics
+- Design systems that can operate asynchronously without blocking the main flow
+- Use queues or schedulers for reliability
+
+### 🛡️ Safety & Output Control
+
+- Implement guardrails to prevent sensitive data exposure
+- Filter internal system details from outputs
+- Enforce structured responses where needed
+- Add role-based or environment-based behaviour controls
+
+### 🚀 Planning & Reasoning Systems
+
+- Separate **planning** from **execution**
+- Use lightweight reasoning for simple tasks and deeper planning for complex ones
+- Allow fallback strategies if initial plans fail
+- Track task progress and intermediate steps
+
+### 🧪 Developer Experience (DX)
+
+- Provide clear CLI feedback and logs
+- Make debugging easy with verbose modes
+- Ensure fast iteration cycles (hot reload, fast builds)
+- Document tool capabilities and expected inputs clearly
+
+### 📈 Observability & Analytics
+
+- Track usage, errors, and performance metrics
+- Log agent decisions and tool calls for transparency
+- Use analytics to improve system behaviour over time
 
 ---
 
@@ -89,23 +113,27 @@ src/
 ## ⚙️ How to Use & Explore
 
 ### 📦 Prerequisites
+
 - **[Bun Runtime](https://bun.sh)** (Highly Recommended) or Node.js v18+
 - **TypeScript** installed globally
 
 ### 🚀 Getting Started
 
 1.  **Clone the repository:**
+
     ```bash
     git clone https://github.com/your-username/claude-leaked.git
     cd claude-leaked
     ```
 
 2.  **Install Dependencies:**
+
     ```bash
     npm install
     ```
 
 3.  **Build the Project:**
+
     ```bash
     npm run build
     ```
@@ -116,7 +144,9 @@ src/
     ```
 
 ### 🔍 Explore with MCP
+
 This repo includes an **MCP Server** to let you explore the source using Claude itself:
+
 ```bash
 claude mcp add code-explorer -- npx -y claude-code-explorer-mcp
 ```
@@ -124,19 +154,23 @@ claude mcp add code-explorer -- npx -y claude-code-explorer-mcp
 ---
 
 ## 📈 SEO & Rankings
+
 **Keywords:** `Claude Code Leak`, `Anthropic Source Code`, `AI Agent Framework`, `Claude 3.5 Sonnet CLI`, `Tengu Anthropic`, `npm sourcemap leak`, `Open Source AI Agent`.
 
 ---
 
-## 📜 Credits & Legal
+Earlier today (March 31st, 2026)
 
-- **Discovery:** [Chaofan Shou (@Fried_rice)](https://x.com/Fried_rice)
-- **Source Post:** [Twitter/X Announcement](https://x.com/Fried_rice/status/2038894956459290963)
-- **Author of this Mirror:** [Yasas Banu](https://www.yasasbanuka.tech)
+This repository explores how a full AI-powered coding CLI can be structured, and uses that as a foundation to break down architecture patterns, system design decisions, and best practices for building similar tools.
 
-**Disclaimer:** All original source code is the proprietary property of **Anthropic PBC**. This repository is for educational and archival purposes only. **This is not an official Anthropic product.**
+---
+
+## 📜 Notes
+
+This repository is intended as a technical exploration of AI system design, architecture patterns, and developer tooling concepts.
 
 ---
 
 ### 📩 Contact
-For spamming reasons the email has been removed
+
+Contact details removed for privacy.
