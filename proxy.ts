@@ -20,6 +20,7 @@
  */
 
 import { execFileSync } from "child_process";
+import { createHmac, timingSafeEqual } from "crypto";
 
 const PORT = process.env.PROXY_PORT ? parseInt(process.env.PROXY_PORT) : 3099;
 const ANTHROPIC_API = "https://api.anthropic.com";
@@ -31,6 +32,37 @@ const DEEPSEEK_API_URL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.
 const DEEPSEEK_MODELS = new Set(["deepseek-chat", "deepseek-reasoner", "deepseek-v3", "deepseek-coder"]);
 const SMARTASSIST_URL = process.env.SMARTASSIST_URL || "";
 const SMARTASSIST_INTERNAL_SECRET = process.env.SMARTASSIST_INTERNAL_SECRET || "";
+
+// ─── STT WebSocket relay ─────────────────────────────────────────────────────
+
+interface SttWsData {
+  upstream: WebSocket | null;
+  keepAliveTimer: ReturnType<typeof setInterval> | null;
+}
+
+/**
+ * Verify a short-lived HMAC token issued by SmartAssist /api/mai/stt-token.
+ * Format: "<timestamp_s>.<hmac_sha256_hex>"
+ * Valid for 5 minutes from issuance.
+ */
+function verifySttToken(token: string | null): boolean {
+  if (!token || !SMARTASSIST_INTERNAL_SECRET) return false;
+  const dotIdx = token.indexOf(".");
+  if (dotIdx < 0) return false;
+  const tsStr = token.slice(0, dotIdx);
+  const sig = token.slice(dotIdx + 1);
+  const ts = parseInt(tsStr, 10);
+  const now = Math.floor(Date.now() / 1000);
+  if (isNaN(ts) || Math.abs(now - ts) > 300) return false;
+  const expected = createHmac("sha256", SMARTASSIST_INTERNAL_SECRET)
+    .update(`stt:${tsStr}`)
+    .digest("hex");
+  try {
+    return timingSafeEqual(Buffer.from(sig, "hex"), Buffer.from(expected, "hex"));
+  } catch {
+    return false;
+  }
+}
 
 // ─── Token management ────────────────────────────────────────────────────────
 
@@ -667,7 +699,7 @@ if (GCP_PROJECT) {
 
 const server = Bun.serve({
   port: PORT,
-  async fetch(req) {
+  async fetch(req, server: any) {
     const url = new URL(req.url);
 
     if (url.pathname === "/health") {
@@ -1099,7 +1131,104 @@ const server = Bun.serve({
       return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
     }
 
+    // ─── WebSocket STT relay ──────────────────────────────────────────────────
+    // Upgrades to a WebSocket that relays PCM16 audio → Anthropic voice_stream.
+    // Auth: short-lived HMAC token issued by SmartAssist /api/mai/stt-token.
+    if (url.pathname === "/ws/stt") {
+      const token = url.searchParams.get("token") || req.headers.get("x-stt-token") || "";
+      if (!verifySttToken(token)) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const upgraded = server.upgrade(req, { data: { upstream: null, keepAliveTimer: null } as SttWsData });
+      if (upgraded) return undefined as any;
+      return new Response("WebSocket upgrade failed", { status: 400 });
+    }
+
     return Response.json({ error: "Not found" }, { status: 404 });
+  },
+
+  // ─── WebSocket STT relay handlers ────────────────────────────────────────
+  websocket: {
+    async open(ws: any) {
+      console.log("[proxy/ws/stt] Client connected — fetching OAuth token");
+      const oauthToken = await getAccessToken();
+      if (!oauthToken) {
+        console.error("[proxy/ws/stt] No OAuth token — closing client");
+        ws.close(1008, "No auth token");
+        return;
+      }
+
+      const sttParams = new URLSearchParams({
+        encoding: "linear16",
+        sample_rate: "16000",
+        channels: "1",
+        endpointing_ms: "300",
+        utterance_end_ms: "1000",
+        language: "en",
+        use_conversation_engine: "true",
+        stt_provider: "deepgram-nova3",
+      });
+
+      const upstream = new (WebSocket as any)(
+        `wss://api.anthropic.com/api/ws/speech_to_text/voice_stream?${sttParams}`,
+        {
+          headers: {
+            "Authorization": `Bearer ${oauthToken}`,
+            "x-app": "cli",
+            "anthropic-version": ANTHROPIC_VERSION,
+            "anthropic-beta": OAUTH_BETA,
+          },
+        },
+      ) as WebSocket;
+
+      ws.data.upstream = upstream;
+
+      upstream.onopen = () => {
+        console.log("[proxy/ws/stt] Upstream Anthropic STT connected");
+        // KeepAlive every 8s per Anthropic protocol
+        ws.data.keepAliveTimer = setInterval(() => {
+          if ((upstream as any).readyState === 1 /* OPEN */) {
+            upstream.send('{"type":"KeepAlive"}');
+          } else {
+            clearInterval(ws.data.keepAliveTimer);
+            ws.data.keepAliveTimer = null;
+          }
+        }, 8000);
+      };
+
+      upstream.onmessage = (event: any) => {
+        // Forward TranscriptText / TranscriptEndpoint / TranscriptError to client
+        try { ws.send(typeof event.data === "string" ? event.data : event.data); } catch { /* client closed */ }
+      };
+
+      upstream.onclose = (event: any) => {
+        console.log(`[proxy/ws/stt] Upstream closed code=${event.code}`);
+        if (ws.data.keepAliveTimer) { clearInterval(ws.data.keepAliveTimer); ws.data.keepAliveTimer = null; }
+        try { ws.close(1000, "Upstream closed"); } catch { /* already closed */ }
+      };
+
+      upstream.onerror = (err: any) => {
+        console.error("[proxy/ws/stt] Upstream error:", err?.message || err);
+        if (ws.data.keepAliveTimer) { clearInterval(ws.data.keepAliveTimer); ws.data.keepAliveTimer = null; }
+        try { ws.close(1011, "Upstream error"); } catch { /* already closed */ }
+      };
+    },
+
+    message(ws: any, data: string | Uint8Array | Buffer) {
+      // Client → upstream: binary frames are PCM16 audio, strings are JSON control messages
+      const upstream: WebSocket | null = ws.data.upstream;
+      if (!upstream || (upstream as any).readyState !== 1 /* OPEN */) return;
+      try { upstream.send(data as any); } catch { /* upstream closed */ }
+    },
+
+    close(ws: any, code: number, reason: string) {
+      console.log(`[proxy/ws/stt] Client disconnected code=${code} reason=${reason}`);
+      if (ws.data.keepAliveTimer) { clearInterval(ws.data.keepAliveTimer); ws.data.keepAliveTimer = null; }
+      const upstream: WebSocket | null = ws.data.upstream;
+      if (upstream && (upstream as any).readyState === 1 /* OPEN */) {
+        try { upstream.send('{"type":"CloseStream"}'); upstream.close(); } catch { /* ignore */ }
+      }
+    },
   },
 });
 
