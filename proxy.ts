@@ -487,9 +487,28 @@ function convertMessagesToAnthropic(messages: any[]): any[] {
 function convertOpenAIToAnthropic(body: any): any {
   const messages = body.messages || [];
   const systemMessages = messages.filter((m: any) => m.role === "system");
-  const system = systemMessages.map((m: any) =>
-    typeof m.content === "string" ? m.content : m.content.map((c: any) => c.text || "").join("\n")
-  ).join("\n\n");
+
+  // Flatten all system messages into content blocks, preserving cache_control when present.
+  // SmartAssist sends system content as [{type:"text", text:"...", cache_control:{type:"ephemeral"}}, ...]
+  // to enable Claude's native prompt caching on the static system prompt.
+  const systemBlocks: any[] = systemMessages.flatMap((m: any) => {
+    if (Array.isArray(m.content)) {
+      return m.content.map((c: any) => ({
+        type: "text",
+        text: c.text || "",
+        ...(c.cache_control ? { cache_control: c.cache_control } : {}),
+      })).filter((b: any) => b.text);
+    }
+    const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+    return text ? [{ type: "text", text }] : [];
+  });
+
+  // If any block has cache_control, pass as array (required for Anthropic caching API).
+  // Otherwise collapse to a plain string (simpler, no unnecessary array overhead).
+  const hasCacheControl = systemBlocks.some((b: any) => b.cache_control);
+  const system = systemBlocks.length === 0 ? "" :
+    hasCacheControl ? systemBlocks :
+    systemBlocks.map((b: any) => b.text).join("\n\n");
 
   // Convert tools
   const tools = (body.tools || [])
@@ -807,7 +826,8 @@ const server = Bun.serve({
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
         "anthropic-version": ANTHROPIC_VERSION,
-        "anthropic-beta": OAUTH_BETA,
+        // prompt-caching-2024-07-31 enables cache_control in system/user blocks
+        "anthropic-beta": `${OAUTH_BETA},prompt-caching-2024-07-31`,
       };
 
       const reqStart = Date.now();
