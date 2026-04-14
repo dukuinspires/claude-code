@@ -215,17 +215,26 @@ function readCredentialsFromKeychain(): OAuthCredentials | null {
 
 async function doRefreshToken(rt: string): Promise<OAuthCredentials["claudeAiOauth"] | null> {
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
     const res = await fetch("https://platform.claude.com/v1/oauth/token", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "axios/1.15.0",
+      },
       body: JSON.stringify({
         grant_type: "refresh_token",
         refresh_token: rt,
         client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+        scope: "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
       }),
-    });
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeout));
     if (!res.ok) {
-      console.error(`[proxy] Token refresh failed: ${res.status}`);
+      const errBody = await res.text().catch(() => "");
+      console.error(`[proxy] Token refresh failed: ${res.status} | ${errBody.slice(0, 200)}`);
       return null;
     }
     const data = await res.json() as any;
