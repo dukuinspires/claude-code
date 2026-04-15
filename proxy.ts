@@ -770,6 +770,7 @@ const server = Bun.serve({
             "Content-Type": "application/json",
             "anthropic-version": ANTHROPIC_VERSION,
             "anthropic-beta": `${OAUTH_BETA},web-search-2025-03-05`,
+            "x-app": "cli",
           },
           body: JSON.stringify({
             model: "claude-haiku-4-5-20251001",
@@ -813,6 +814,7 @@ const server = Bun.serve({
               "Content-Type": "application/json",
               "anthropic-version": ANTHROPIC_VERSION,
               "anthropic-beta": `${OAUTH_BETA},web-search-2025-03-05`,
+              "x-app": "cli",
             },
             body: JSON.stringify({
               model: "claude-haiku-4-5-20251001",
@@ -883,6 +885,7 @@ const server = Bun.serve({
         "anthropic-version": ANTHROPIC_VERSION,
         // prompt-caching-2024-07-31 enables cache_control in system/user blocks
         "anthropic-beta": `${OAUTH_BETA},prompt-caching-2024-07-31`,
+        "x-app": "cli",
       };
 
       const reqStart = Date.now();
@@ -1100,6 +1103,7 @@ const server = Bun.serve({
         "Authorization": `Bearer ${token}`,
         "anthropic-version": ANTHROPIC_VERSION,
         "anthropic-beta": OAUTH_BETA,
+        "x-app": "cli",
       };
       for (const [k, v] of req.headers.entries()) {
         const lower = k.toLowerCase();
