@@ -26,6 +26,16 @@ const PORT = process.env.PROXY_PORT ? parseInt(process.env.PROXY_PORT) : 3099;
 const ANTHROPIC_API = "https://api.anthropic.com";
 const ANTHROPIC_VERSION = "2023-06-01";
 const OAUTH_BETA = "oauth-2025-04-20";
+const PROXY_VERSION = "1.0.0";
+const CLI_USER_AGENT = `claude-cli/${PROXY_VERSION} (user, cli)`;
+
+// Build the billing header Claude Code sends on every request.
+// cc_entrypoint=cli → subscription pool (same as interactive terminals)
+// cc_workload=cron  → background jobs routed to batch/lower-QoS pool
+function buildBillingHeader(workload?: "cron"): string {
+  const base = `cc_version=${PROXY_VERSION}; cc_entrypoint=cli;`;
+  return workload ? `${base} cc_workload=${workload};` : base;
+}
 const OPENAI_FALLBACK_KEY = process.env.OPENAI_API_KEY || "";
 const DEEPSEEK_FALLBACK_KEY = process.env.DEEPSEEK_API_KEY || "";
 const DEEPSEEK_API_URL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
@@ -771,6 +781,8 @@ const server = Bun.serve({
             "anthropic-version": ANTHROPIC_VERSION,
             "anthropic-beta": `${OAUTH_BETA},web-search-2025-03-05`,
             "x-app": "cli",
+            "User-Agent": CLI_USER_AGENT,
+            "x-anthropic-billing-header": buildBillingHeader(),
           },
           body: JSON.stringify({
             model: "claude-haiku-4-5-20251001",
@@ -815,6 +827,8 @@ const server = Bun.serve({
               "anthropic-version": ANTHROPIC_VERSION,
               "anthropic-beta": `${OAUTH_BETA},web-search-2025-03-05`,
               "x-app": "cli",
+              "User-Agent": CLI_USER_AGENT,
+              "x-anthropic-billing-header": buildBillingHeader(),
             },
             body: JSON.stringify({
               model: "claude-haiku-4-5-20251001",
@@ -879,6 +893,7 @@ const server = Bun.serve({
       const reqLabel = `${originalModel}→${anthropicBody.model}`;
       console.log(`[proxy] ▸ REQ ${reqLabel} | stream=${!!body.stream} | priority=${priority} | bgh=${bgHighSem.inFlight}/${BG_HIGH_SLOTS}(q=${bgHighSem.waiting}) bgl=${bgLowSem.inFlight}/${BG_LOW_SLOTS}(q=${bgLowSem.waiting})`);
 
+      const isBgJob = priority === "background-high" || priority === "background-low";
       const headers = {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
@@ -886,6 +901,10 @@ const server = Bun.serve({
         // prompt-caching-2024-07-31 enables cache_control in system/user blocks
         "anthropic-beta": `${OAUTH_BETA},prompt-caching-2024-07-31`,
         "x-app": "cli",
+        "User-Agent": CLI_USER_AGENT,
+        // Billing header — routes to subscription pool (cc_entrypoint=cli)
+        // Background jobs use cc_workload=cron → batch/lower-QoS routing
+        "x-anthropic-billing-header": buildBillingHeader(isBgJob ? "cron" : undefined),
       };
 
       const reqStart = Date.now();
@@ -1104,6 +1123,8 @@ const server = Bun.serve({
         "anthropic-version": ANTHROPIC_VERSION,
         "anthropic-beta": OAUTH_BETA,
         "x-app": "cli",
+        "User-Agent": CLI_USER_AGENT,
+        "x-anthropic-billing-header": buildBillingHeader(),
       };
       for (const [k, v] of req.headers.entries()) {
         const lower = k.toLowerCase();
