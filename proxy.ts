@@ -20,7 +20,10 @@
  */
 
 import { execFileSync } from "child_process";
-import { createHmac, timingSafeEqual } from "crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "crypto";
+
+// Session ID — generated once at proxy startup, mirrors X-Claude-Code-Session-Id behaviour
+const PROXY_SESSION_ID = randomUUID();
 
 const PORT = process.env.PROXY_PORT ? parseInt(process.env.PROXY_PORT) : 3099;
 const ANTHROPIC_API = "https://api.anthropic.com";
@@ -783,6 +786,8 @@ const server = Bun.serve({
             "x-app": "cli",
             "User-Agent": CLI_USER_AGENT,
             "x-anthropic-billing-header": buildBillingHeader(),
+            "X-Claude-Code-Session-Id": PROXY_SESSION_ID,
+            "x-client-request-id": randomUUID(),
           },
           body: JSON.stringify({
             model: "claude-haiku-4-5-20251001",
@@ -898,13 +903,14 @@ const server = Bun.serve({
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
         "anthropic-version": ANTHROPIC_VERSION,
-        // prompt-caching-2024-07-31 enables cache_control in system/user blocks
-        "anthropic-beta": `${OAUTH_BETA},prompt-caching-2024-07-31`,
+        "anthropic-beta": `${OAUTH_BETA},prompt-caching-2024-07-31,claude-code-20250219`,
         "x-app": "cli",
         "User-Agent": CLI_USER_AGENT,
         // Billing header — routes to subscription pool (cc_entrypoint=cli)
         // Background jobs use cc_workload=cron → batch/lower-QoS routing
         "x-anthropic-billing-header": buildBillingHeader(isBgJob ? "cron" : undefined),
+        "X-Claude-Code-Session-Id": PROXY_SESSION_ID,
+        "x-client-request-id": randomUUID(),
       };
 
       const reqStart = Date.now();
@@ -1125,6 +1131,8 @@ const server = Bun.serve({
         "x-app": "cli",
         "User-Agent": CLI_USER_AGENT,
         "x-anthropic-billing-header": buildBillingHeader(),
+        "X-Claude-Code-Session-Id": PROXY_SESSION_ID,
+        "x-client-request-id": randomUUID(),
       };
       for (const [k, v] of req.headers.entries()) {
         const lower = k.toLowerCase();
