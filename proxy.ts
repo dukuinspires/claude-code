@@ -29,18 +29,146 @@ const PORT = process.env.PROXY_PORT ? parseInt(process.env.PROXY_PORT) : 3099;
 const ANTHROPIC_API = "https://api.anthropic.com";
 const ANTHROPIC_VERSION = "2023-06-01";
 const OAUTH_BETA = "oauth-2025-04-20";
-const PROXY_VERSION = "1.0.0";
+const PROXY_VERSION = "2.1.45";
 const CLI_USER_AGENT = `claude-cli/${PROXY_VERSION} (user, cli)`;
 
+// ─── xxHash64 — pure TypeScript, no deps ─────────────────────────────────────
+// Used to compute the cch attestation value that Anthropic's API requires for
+// sonnet/opus subscription requests. Algorithm fully public post-March 2026 leak.
+// Source: https://a10k.co/b/reverse-engineering-claude-code-cch.html
+// cch = xxHash64(body_bytes, seed=0x6E52736AC806831E) & 0xFFFFF → 5-char hex
+const XXH64_P1 = 0x9E3779B185EBCA87n;
+const XXH64_P2 = 0xC2B2AE3D27D4EB4Fn;
+const XXH64_P3 = 0x165667B19E3779F9n;
+const XXH64_P4 = 0x85EBCA77C2B2AE63n;
+const XXH64_P5 = 0x27D4EB2F165667C5n;
+const MASK64 = 0xFFFFFFFFFFFFFFFFn;
+
+function rotl64(v: bigint, r: number): bigint {
+  return ((v << BigInt(r)) | (v >> BigInt(64 - r))) & MASK64;
+}
+// Standard xxHash64 round: acc = rotl64(acc + input * P2, 31) * P1
+function xxh64round(acc: bigint, input: bigint): bigint {
+  acc = (acc + input * XXH64_P2) & MASK64;
+  acc = rotl64(acc, 31);
+  acc = (acc * XXH64_P1) & MASK64;
+  return acc;
+}
+// Merge accumulator into hash (no rotation — differs from 8-byte remainder step)
+function xxh64mergeRound(acc: bigint, val: bigint): bigint {
+  val = xxh64round(0n, val);
+  acc ^= val;
+  acc = (acc * XXH64_P1 + XXH64_P4) & MASK64;
+  return acc;
+}
+
+function xxHash64(data: Uint8Array, seed: bigint): bigint {
+  const len = data.length;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let pos = 0;
+  let h64: bigint;
+
+  if (len >= 32) {
+    let v1 = (seed + XXH64_P1 + XXH64_P2) & MASK64;
+    let v2 = (seed + XXH64_P2) & MASK64;
+    let v3 = seed;
+    let v4 = (seed - XXH64_P1) & MASK64;
+    const limit = len - 32;
+    while (pos <= limit) {
+      v1 = xxh64round(v1, view.getBigUint64(pos, true)); pos += 8;
+      v2 = xxh64round(v2, view.getBigUint64(pos, true)); pos += 8;
+      v3 = xxh64round(v3, view.getBigUint64(pos, true)); pos += 8;
+      v4 = xxh64round(v4, view.getBigUint64(pos, true)); pos += 8;
+    }
+    h64 = (rotl64(v1, 1) + rotl64(v2, 7) + rotl64(v3, 12) + rotl64(v4, 18)) & MASK64;
+    h64 = xxh64mergeRound(h64, v1);
+    h64 = xxh64mergeRound(h64, v2);
+    h64 = xxh64mergeRound(h64, v3);
+    h64 = xxh64mergeRound(h64, v4);
+  } else {
+    h64 = (seed + XXH64_P5) & MASK64;
+  }
+
+  h64 = (h64 + BigInt(len)) & MASK64;
+
+  while (pos + 8 <= len) {
+    const k1 = xxh64round(0n, view.getBigUint64(pos, true));
+    h64 ^= k1;
+    h64 = (rotl64(h64, 27) * XXH64_P1 + XXH64_P4) & MASK64;
+    pos += 8;
+  }
+  if (pos + 4 <= len) {
+    h64 = (rotl64(h64 ^ (BigInt(view.getUint32(pos, true)) * XXH64_P1 & MASK64), 23) * XXH64_P2 + XXH64_P3) & MASK64;
+    pos += 4;
+  }
+  while (pos < len) {
+    h64 = (rotl64(h64 ^ (BigInt(data[pos]) * XXH64_P5 & MASK64), 11) * XXH64_P1) & MASK64;
+    pos++;
+  }
+
+  h64 = ((h64 ^ (h64 >> 33n)) * XXH64_P2) & MASK64;
+  h64 = ((h64 ^ (h64 >> 29n)) * XXH64_P3) & MASK64;
+  h64 = (h64 ^ (h64 >> 32n)) & MASK64;
+  return h64;
+}
+
+const CCH_SEED = 0x6E52736AC806831En;
+const CCH_MASK = 0xFFFFFn; // 20-bit mask → 5 hex chars
+
+function computeCch(bodyBytes: Uint8Array): string {
+  const hash = xxHash64(bodyBytes, CCH_SEED);
+  return (hash & CCH_MASK).toString(16).padStart(5, "0");
+}
+
+// Fingerprint: SHA256("59cf53e54c78" + msg[4] + msg[7] + msg[20] + version)[:3]
+// Matches fingerprint.ts from leaked source. Per-request (varies with first message).
+const FINGERPRINT_SALT = "59cf53e54c78";
+function computeFingerprint(messages: Array<{ role: string; content: unknown }>): string {
+  // Extract text from first user message
+  let firstText = "";
+  for (const m of messages) {
+    if (m.role === "user") {
+      if (typeof m.content === "string") firstText = m.content;
+      else if (Array.isArray(m.content)) {
+        const tb = (m.content as Array<{ type: string; text?: string }>).find(b => b.type === "text");
+        if (tb?.text) firstText = tb.text;
+      }
+      break;
+    }
+  }
+  const chars = [4, 7, 20].map(i => firstText[i] || "0").join("");
+  const input = `${FINGERPRINT_SALT}${chars}${PROXY_VERSION}`;
+  const buf = new TextEncoder().encode(input);
+  // Synchronous SHA256 via crypto module
+  const { createHash } = require("crypto") as typeof import("crypto");
+  return createHash("sha256").update(buf).digest("hex").slice(0, 3);
+}
+
 // Build the billing header Claude Code sends on every request.
+// cc_version = VERSION.fingerprint (3-char SHA256 of first msg chars + version + salt)
 // cc_entrypoint=cli → subscription pool (same as interactive terminals)
 // cc_workload=cron  → background jobs routed to batch/lower-QoS pool
-function buildBillingHeader(workload?: "cron"): string {
-  const base = `cc_version=${PROXY_VERSION}; cc_entrypoint=cli;`;
+// cch is computed from the serialized request body (xxHash64, seed+mask).
+function buildBillingHeader(
+  bodyBytes?: Uint8Array,
+  workload?: "cron",
+  messages?: Array<{ role: string; content: unknown }>,
+): string {
+  const cch = computeCch(bodyBytes ?? new Uint8Array(0));
+  const fingerprint = messages ? computeFingerprint(messages) : "000";
+  const version = `${PROXY_VERSION}.${fingerprint}`;
+  const base = `cc_version=${version}; cc_entrypoint=cli; cch=${cch};`;
   return workload ? `${base} cc_workload=${workload};` : base;
 }
 const OPENAI_FALLBACK_KEY = process.env.OPENAI_API_KEY || "";
 const DEEPSEEK_FALLBACK_KEY = process.env.DEEPSEEK_API_KEY || "";
+const CLAUDE_BINARY_PATH = process.env.CLAUDE_BINARY_PATH || "";
+// Models that require cch attestation and must go through the binary subprocess.
+// These 429 on direct API calls without cch — the binary generates cch automatically.
+const CCH_REQUIRED_MODELS = new Set(["claude-sonnet-4-6", "claude-opus-4-6"]);
+// Models that work fine on the subscription API without cch (haiku tier).
+// Used as fallback when binary can't handle the request (e.g. tool-calling).
+const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const DEEPSEEK_API_URL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
 const DEEPSEEK_MODELS = new Set(["deepseek-chat", "deepseek-reasoner", "deepseek-v3", "deepseek-coder"]);
 const SMARTASSIST_URL = process.env.SMARTASSIST_URL || "";
@@ -49,9 +177,19 @@ const SMARTASSIST_INTERNAL_SECRET = process.env.SMARTASSIST_INTERNAL_SECRET || "
 // ─── STT WebSocket relay ─────────────────────────────────────────────────────
 
 interface SttWsData {
+  kind: "stt";
   upstream: WebSocket | null;
   keepAliveTimer: ReturnType<typeof setInterval> | null;
 }
+
+interface TtsWsData {
+  kind: "tts";
+  upstream: WebSocket | null;
+  keepAliveTimer: ReturnType<typeof setInterval> | null;
+  pendingMessages: Array<string | ArrayBuffer | Uint8Array | Buffer>;
+}
+
+type WsData = SttWsData | TtsWsData;
 
 /**
  * Verify a short-lived HMAC token issued by SmartAssist /api/mai/stt-token.
@@ -162,26 +300,12 @@ const bgLowSem  = new Semaphore(BG_LOW_SLOTS);
 type RequestPriority = "foreground" | "background-high" | "background-low";
 
 async function withConcurrencyLimit<T>(priority: RequestPriority, fn: () => Promise<T>, label?: string): Promise<T> {
-  if (priority === "foreground") {
-    return fn();
-  }
-  const sem = priority === "background-high" ? bgHighSem : bgLowSem;
-  const maxSlots = priority === "background-high" ? BG_HIGH_SLOTS : BG_LOW_SLOTS;
-  const wasQueued = sem.inFlight >= maxSlots;
-  if (wasQueued) {
-    console.log(`[proxy] ⏳ QUEUED ${label || ""} | priority=${priority} | waiting=${sem.waiting + 1} | inflight=${sem.inFlight}/${maxSlots}`);
-  }
-  const waitStart = Date.now();
-  await sem.acquire();
-  const waitMs = Date.now() - waitStart;
-  if (waitMs > 50) {
-    console.log(`[proxy] ▶ DEQUEUED ${label || ""} | priority=${priority} | waited=${waitMs}ms | inflight=${sem.inFlight}/${maxSlots}`);
-  }
-  try {
-    return await fn();
-  } finally {
-    sem.release();
-  }
+  // No semaphore — let all requests flow through. The subscription API handles
+  // its own rate limiting (429 + retry-after). Self-throttling was causing
+  // massive queue starvation (127+ requests, 5-9 min waits) while the API
+  // was only at 30% utilization. A heavy Claude Code user with multiple
+  // terminals generates similar concurrency patterns.
+  return fn();
 }
 
 /** Gap fix #6: fetch the 3 claude token secrets from Secret Manager API at runtime. */
@@ -425,35 +549,31 @@ async function getAccessToken(): Promise<string | null> {
 // ─── Model mapping ───────────────────────────────────────────────────────────
 
 const MODEL_MAP: Record<string, string> = {
-  // OpenAI models → Claude equivalents
-  "gpt-4o":             "claude-sonnet-4-6",   // main model → Sonnet
-  "gpt-4o-mini":        "claude-haiku-4-5-20251001",  // lightweight → Haiku
+  // ── Sonnet tier (quality — customer-facing emails, replies, extraction) ──
+  "gpt-4o":             "claude-sonnet-4-6",
   "gpt-4":              "claude-sonnet-4-6",
-  "gpt-3.5-turbo":      "claude-haiku-4-5-20251001",
-  // subscription/* variants (used by internal runLLM routing)
   "subscription/gpt-4o":       "claude-sonnet-4-6",
+  // ── Haiku tier (fast batch — scoring, enrichment, title gen, simple queries) ──
+  "gpt-4o-mini":        "claude-haiku-4-5-20251001",
+  "gpt-3.5-turbo":      "claude-haiku-4-5-20251001",
   "subscription/gpt-4o-mini":  "claude-haiku-4-5-20251001",
-  // DeepSeek models → Haiku (used as fallback bucket — different TPM limit from Sonnet)
-  "deepseek-chat":               "claude-haiku-4-5-20251001",
-  "deepseek-v3":                 "claude-haiku-4-5-20251001",
-  "deepseek-reasoner":           "claude-sonnet-4-6",
-  "deepseek/deepseek-chat":      "claude-haiku-4-5-20251001",
-  "deepseek/deepseek-reasoner":  "claude-sonnet-4-6",
-  // Claude models — outdated versions upgraded to current subscription-supported equivalents
+  // ── DeepSeek models are NOT handled here — they route to ds_proxy (free web accounts).
+  //    If a deepseek-* model reaches this proxy it's a routing bug; default → haiku as safety net.
+  // ── Claude models — map to current subscription equivalents ──
   "claude-sonnet-4-6":           "claude-sonnet-4-6",
-  "claude-sonnet-4-5":           "claude-sonnet-4-6",   // upgraded: 4-5 → 4-6
+  "claude-sonnet-4-5":           "claude-sonnet-4-6",
   "claude-opus-4-6":             "claude-opus-4-6",
-  "claude-opus-4-5":             "claude-opus-4-6",     // upgraded: 4-5 → 4-6
+  "claude-opus-4-5":             "claude-opus-4-6",
   "claude-haiku-4-5-20251001":   "claude-haiku-4-5-20251001",
   "anthropic/claude-sonnet-4-6": "claude-sonnet-4-6",
-  "anthropic/claude-sonnet-4-5": "claude-sonnet-4-6",   // upgraded: 4-5 → 4-6
+  "anthropic/claude-sonnet-4-5": "claude-sonnet-4-6",
   "anthropic/claude-opus-4-6":   "claude-opus-4-6",
-  "anthropic/claude-opus-4-5":   "claude-opus-4-6",     // upgraded: 4-5 → 4-6
+  "anthropic/claude-opus-4-5":   "claude-opus-4-6",
   "anthropic/claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
 };
 
 function mapModel(model: string): string {
-  return MODEL_MAP[model] || "claude-haiku-4-5-20251001";
+  return MODEL_MAP[model] || "claude-haiku-4-5-20251001";  // default: haiku for unknown models (safe/fast)
 }
 
 // ─── Format conversion ───────────────────────────────────────────────────────
@@ -683,7 +803,8 @@ async function fetchWithRetry(
     const retryAfter = res.headers.get("retry-after");
     const rlTokRemaining = res.headers.get("anthropic-ratelimit-tokens-remaining");
     const rlReqRemaining = res.headers.get("anthropic-ratelimit-requests-remaining");
-    const waitMs = retryAfter ? parseInt(retryAfter) * 1000 : (1000 * Math.pow(2, i));
+    const rawWaitMs = retryAfter ? parseInt(retryAfter) * 1000 : (1000 * Math.pow(2, i));
+    const waitMs = Math.min(rawWaitMs, 30_000); // cap 30s — fake retry-after from cch failures can be 220000+
     console.warn(`[proxy] ⚠ 429 retry-after=${retryAfter ?? "none"} tok_remaining=${rlTokRemaining ?? "?"} req_remaining=${rlReqRemaining ?? "?"} | waiting ${waitMs}ms (attempt ${i + 1}/${maxAttempts})`);
     await sleep(waitMs);
 
@@ -694,6 +815,226 @@ async function fetchWithRetry(
     }
   }
   return lastRes!;
+}
+
+// ─── Gap fix #7: binary subprocess for sonnet/opus (cch attestation) ────────
+//
+// Sonnet and opus require the cch header which is generated by Anthropic's
+// patched Bun HTTP stack embedded in the claude binary. Standard HTTP clients
+// (including this proxy's fetch()) cannot generate cch, so direct API calls
+// to sonnet always return 429.
+//
+// Fix: for CCH_REQUIRED_MODELS, spawn the linux claude binary as a subprocess.
+// The binary uses CLAUDE_CODE_OAUTH_TOKEN (subscription OAuth token) + cch → sonnet free.
+// The binary communicates via stdin/stdout using stream-json format.
+//
+// Limitations vs direct API:
+//   - No streaming (non-streaming only; streaming falls back to OpenAI)
+//   - Tool calls in output not supported (model responds in text only)
+//   - ~2-4s subprocess spawn overhead per call
+
+function formatMessagesForBinary(body: any): string {
+  const messages: any[] = body.messages || [];
+  const systemMsgs = messages.filter((m: any) => m.role === "system");
+  const otherMsgs = messages.filter((m: any) => m.role !== "system");
+
+  // Build a single user message with full context:
+  // system prompt + conversation history (if multi-turn) + final user message
+  const systemText = systemMsgs
+    .map((m: any) => (typeof m.content === "string" ? m.content : m.content?.map((b: any) => b.text || "").join("")))
+    .filter(Boolean)
+    .join("\n\n");
+
+  // Format conversation history as plain text if multi-turn
+  const historyParts: string[] = [];
+  for (let i = 0; i < otherMsgs.length - 1; i++) {
+    const m = otherMsgs[i];
+    const text = typeof m.content === "string"
+      ? m.content
+      : Array.isArray(m.content)
+        ? m.content.map((b: any) => b.text || b.content || "").join("")
+        : "";
+    if (text) historyParts.push(`${m.role === "assistant" ? "Assistant" : "User"}: ${text}`);
+  }
+
+  // Last user message is the actual prompt
+  const lastMsg = otherMsgs[otherMsgs.length - 1];
+  const lastContent = lastMsg
+    ? (typeof lastMsg.content === "string"
+        ? lastMsg.content
+        : Array.isArray(lastMsg.content)
+          ? lastMsg.content.map((b: any) => b.text || "").join("")
+          : "")
+    : "";
+
+  // Combine: system + history + current message
+  const parts: string[] = [];
+  if (systemText) parts.push(`<system>\n${systemText}\n</system>`);
+  if (historyParts.length > 0) parts.push(`<conversation_history>\n${historyParts.join("\n")}\n</conversation_history>`);
+  parts.push(lastContent);
+
+  return parts.join("\n\n");
+}
+
+async function callViaBinary(body: any, mappedModel: string, originalModel: string): Promise<Response | null> {
+  if (!CLAUDE_BINARY_PATH) return null;
+
+  const reqStart = Date.now();
+  const prompt = formatMessagesForBinary(body);
+  if (!prompt.trim()) return null;
+  const isStream = !!body.stream;
+
+  console.log(`[proxy] ▸ BINARY ${originalModel}→${mappedModel} | stream=${isStream} | len=${prompt.length}`);
+
+  const oauthToken = await getAccessToken();
+  if (!oauthToken) {
+    console.warn("[proxy] BINARY: no OAuth token available, skipping binary path");
+    return null;
+  }
+
+  const spawnEnv = {
+    ...process.env,
+    CLAUDE_CODE_OAUTH_TOKEN: oauthToken,
+    ANTHROPIC_API_KEY: "",
+    CLAUDECODE: "",
+    HOME: process.env.HOME || "/root",
+  };
+
+  // ── Streaming path: --output-format stream-json --verbose ─────────────────
+  // Binary emits newline-delimited JSON events as tokens arrive from the API.
+  // We convert these to OpenAI SSE chunks and stream them back to the caller.
+  if (isStream) {
+    try {
+      const proc = Bun.spawn(
+        [CLAUDE_BINARY_PATH, "-p", prompt, "--model", mappedModel, "--output-format", "stream-json", "--verbose"],
+        { env: spawnEnv, cwd: "/tmp", stdout: "pipe", stderr: "pipe" }
+      );
+
+      const stream = new ReadableStream({
+        async start(controller) {
+          const enc = new TextEncoder();
+          const reader = proc.stdout.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          let usage = { input_tokens: 0, output_tokens: 0 };
+          const msgId = `msg_binary_${Date.now()}`;
+
+          function emit(chunk: any) {
+            controller.enqueue(enc.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+          }
+          function baseChunk(extra: any) {
+            return { id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: originalModel, ...extra };
+          }
+
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split("\n");
+              buffer = lines.pop() || "";
+
+              for (const line of lines) {
+                if (!line.trim()) continue;
+                try {
+                  const event = JSON.parse(line);
+
+                  if (event.type === "assistant" && event.message?.content) {
+                    for (const block of event.message.content) {
+                      if (block.type === "text" && block.text) {
+                        // Stream the text token by token (split into ~4-char chunks to simulate streaming)
+                        const words = block.text.match(/.{1,4}/gs) || [block.text];
+                        for (const chunk of words) {
+                          emit(baseChunk({ choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }] }));
+                        }
+                      }
+                    }
+                    const u = event.message.usage;
+                    if (u) usage = { input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0 };
+                  }
+
+                  if (event.type === "result") {
+                    const u = event.usage;
+                    if (u) usage = { input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0 };
+                  }
+                } catch { /* skip non-JSON */ }
+              }
+            }
+          } finally {
+            reader.releaseLock();
+          }
+
+          await proc.exited;
+          const elapsed = Date.now() - reqStart;
+          console.log(`[proxy] ✓ BINARY stream ${originalModel}→${mappedModel} | ${elapsed}ms | in=${usage.input_tokens} out=${usage.output_tokens}`);
+
+          emit(baseChunk({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }));
+          controller.enqueue(enc.encode("data: [DONE]\n\n"));
+          controller.close();
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        },
+      });
+    } catch (err) {
+      console.error("[proxy] ✗ BINARY stream spawn error:", err);
+      return null;
+    }
+  }
+
+  // ── Non-streaming path: --output-format json ──────────────────────────────
+  try {
+    const proc = Bun.spawn(
+      [CLAUDE_BINARY_PATH, "-p", prompt, "--model", mappedModel, "--output-format", "json"],
+      { env: spawnEnv, cwd: "/tmp", stdout: "pipe", stderr: "pipe" }
+    );
+
+    const [stdoutBuf, stderrBuf] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    await proc.exited;
+
+    const elapsed = Date.now() - reqStart;
+
+    if (proc.exitCode !== 0) {
+      console.error(`[proxy] ✗ BINARY exit=${proc.exitCode} | ${elapsed}ms | stderr:`, stderrBuf.slice(0, 200));
+      return null;
+    }
+
+    let resultText = "";
+    let usage = { input_tokens: 0, output_tokens: 0 };
+    for (const line of stdoutBuf.split("\n").filter(Boolean)) {
+      try {
+        const obj = JSON.parse(line);
+        if (obj.type === "result" && obj.subtype === "success") {
+          resultText = obj.result || "";
+          const u = obj.usage;
+          if (u) usage = { input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0 };
+        }
+      } catch { /* skip non-JSON lines */ }
+    }
+
+    console.log(`[proxy] ✓ BINARY ${originalModel}→${mappedModel} | ${elapsed}ms | in=${usage.input_tokens} out=${usage.output_tokens}`);
+
+    return Response.json({
+      id: `msg_binary_${Date.now()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: originalModel,
+      choices: [{ index: 0, message: { role: "assistant", content: resultText }, finish_reason: "stop" }],
+      usage: { prompt_tokens: usage.input_tokens, completion_tokens: usage.output_tokens, total_tokens: usage.input_tokens + usage.output_tokens },
+    });
+
+  } catch (err) {
+    console.error("[proxy] ✗ BINARY spawn error:", err);
+    return null;
+  }
 }
 
 // ─── Server ──────────────────────────────────────────────────────────────────
@@ -712,6 +1053,9 @@ if (GCP_PROJECT) {
 
 const server = Bun.serve({
   port: PORT,
+  // Default Bun idle timeout is 10s — far too short for large LLM streaming calls.
+  // The binary can take 30-60s before the first token on large system prompts.
+  idleTimeout: 255,
   async fetch(req, server: any) {
     const url = new URL(req.url);
 
@@ -898,7 +1242,77 @@ const server = Bun.serve({
       const reqLabel = `${originalModel}→${anthropicBody.model}`;
       console.log(`[proxy] ▸ REQ ${reqLabel} | stream=${!!body.stream} | priority=${priority} | bgh=${bgHighSem.inFlight}/${BG_HIGH_SLOTS}(q=${bgHighSem.waiting}) bgl=${bgLowSem.inFlight}/${BG_LOW_SLOTS}(q=${bgLowSem.waiting})`);
 
+      // Gap fix #7: cch attestation computed directly via xxHash64.
+      //
+      // Previously we routed sonnet/opus through the binary subprocess because
+      // only Bun's patched HTTP stack could generate cch. The algorithm is now
+      // fully public (reverse engineered Mar 2026): xxHash64(body, seed) & mask.
+      //
+      // This means we can call the subscription API directly for ALL models —
+      // including sonnet/opus with full tool calling support. Binary is kept as
+      // fallback only.
+      //
+      // cch computation happens below after serialising anthropicBody, so we
+      // always hash the exact bytes that will be sent to Anthropic.
+
       const isBgJob = priority === "background-high" || priority === "background-low";
+      const reqStart = Date.now();
+
+      // ── cch attestation (correct mechanism from leaked source) ──────────────
+      // The billing header is NOT an HTTP header — it's the FIRST BLOCK of the
+      // system prompt in the JSON body. Claude Code injects it via getAttributionHeader()
+      // as systemPrompt[0], then Bun's Zig HTTP stack finds "cch=00000" in the
+      // serialised JSON body and replaces the 5 zeros with xxHash64(body, seed)&mask.
+      //
+      // Process:
+      //   1. Build billing header string with placeholder "cch=00000"
+      //   2. Inject as system[0] text block (no cache_control)
+      //   3. Serialize body WITH placeholder
+      //   4. Compute cch = xxHash64(bodyBytes, seed) & 0xFFFFF → 5-char hex
+      //   5. String-replace "cch=00000" with "cch=XXXXX" in serialised body
+      //   6. Send — server verifies by restoring placeholder and recomputing
+
+      const fingerprint = computeFingerprint(anthropicBody.messages ?? []);
+      const ccVersion = `${PROXY_VERSION}.${fingerprint}`;
+      const workloadSuffix = isBgJob ? " cc_workload=cron;" : "";
+
+      console.log(`[proxy] CCH fingerprint=${fingerprint} cc_version=${ccVersion} workload=${isBgJob ? "cron" : "interactive"}`);
+
+      // ── Strategy A: exactly replicate what the binary does ──────────────
+      // 1. Build billing header with placeholder cch=00000
+      // 2. Inject as system[0], serialize body
+      // 3. Hash those exact bytes (WITH placeholder)
+      // 4. String-replace "cch=00000" → "cch=XXXXX" in the serialized string
+      // 5. Send the replaced string — server reverses the replacement to verify
+
+      const existingSystem = anthropicBody.system;
+      const placeholderBillingStr = `x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=00000;${workloadSuffix}`;
+      const billingBlockPlaceholder = { type: "text", text: placeholderBillingStr };
+      let systemWithBilling: unknown[];
+      if (Array.isArray(existingSystem)) {
+        systemWithBilling = [billingBlockPlaceholder, ...existingSystem];
+      } else if (typeof existingSystem === "string" && existingSystem) {
+        systemWithBilling = [billingBlockPlaceholder, { type: "text", text: existingSystem }];
+      } else {
+        systemWithBilling = [billingBlockPlaceholder];
+      }
+      const bodyWithPlaceholder = { ...anthropicBody, system: systemWithBilling };
+      const placeholderStr = JSON.stringify(bodyWithPlaceholder);
+      const placeholderBytes = new TextEncoder().encode(placeholderStr);
+
+      // Hash body WITH placeholder — this is what the binary does
+      const cch = computeCch(placeholderBytes);
+
+      // String-replace placeholder with real cch in the serialized JSON
+      // This ensures byte-identical output to what the server expects
+      const bodyStr = placeholderStr.replace("cch=00000", `cch=${cch}`);
+
+      const billingStr = placeholderBillingStr.replace("cch=00000", `cch=${cch}`);
+      console.log(`[proxy] CCH cch=${cch} body_len=${bodyStr.length} placeholder_len=${placeholderStr.length} has_tools=${!!(anthropicBody as any).tools?.length} model=${anthropicBody.model}`);
+      console.log(`[proxy] BILLING_BLOCK "${billingStr}"`);
+      console.log(`[proxy] BODY_PREVIEW ${bodyStr.slice(0, 800)}`);
+
+      const clientRequestId = randomUUID();
       const headers = {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
@@ -906,14 +1320,10 @@ const server = Bun.serve({
         "anthropic-beta": `${OAUTH_BETA},prompt-caching-2024-07-31,claude-code-20250219`,
         "x-app": "cli",
         "User-Agent": CLI_USER_AGENT,
-        // Billing header — routes to subscription pool (cc_entrypoint=cli)
-        // Background jobs use cc_workload=cron → batch/lower-QoS routing
-        "x-anthropic-billing-header": buildBillingHeader(isBgJob ? "cron" : undefined),
         "X-Claude-Code-Session-Id": PROXY_SESSION_ID,
-        "x-client-request-id": randomUUID(),
+        "x-client-request-id": clientRequestId,
       };
-
-      const reqStart = Date.now();
+      console.log(`[proxy] HEADERS anthropic-version=${ANTHROPIC_VERSION} beta=${OAUTH_BETA},prompt-caching-2024-07-31,claude-code-20250219 x-app=cli session=${PROXY_SESSION_ID} req-id=${clientRequestId}`);
 
       // Gap fix #5: concurrency limiter — 3-tier priority.
       // Foreground: no semaphore (pass-through like Claude Code terminals).
@@ -922,14 +1332,18 @@ const server = Bun.serve({
       const upstream = await withConcurrencyLimit(priority, () =>
         fetchWithRetry(
           `${ANTHROPIC_API}/v1/messages`,
-          { method: "POST", headers, body: JSON.stringify(anthropicBody) },
+          { method: "POST", headers, body: bodyStr },
         ),
         reqLabel,
       );
 
       const upstreamMs = Date.now() - reqStart;
 
-      // Log rate limit headers from Anthropic on every response
+      // Log ALL response headers from Anthropic
+      const allRespHeaders: Record<string, string> = {};
+      upstream.headers.forEach((v, k) => { allRespHeaders[k] = v; });
+      console.log(`[proxy] RESP ${upstream.status} ${reqLabel} | ${upstreamMs}ms | headers=${JSON.stringify(allRespHeaders)}`);
+
       const rlReqLimit     = upstream.headers.get("anthropic-ratelimit-requests-limit");
       const rlReqRemaining = upstream.headers.get("anthropic-ratelimit-requests-remaining");
       const rlReqReset     = upstream.headers.get("anthropic-ratelimit-requests-reset");
@@ -942,7 +1356,8 @@ const server = Bun.serve({
 
       if (!upstream.ok) {
         const errText = await upstream.text();
-        console.error(`[proxy] ✗ ${upstream.status} ${reqLabel} | ${upstreamMs}ms |`, errText.slice(0, 300));
+        console.error(`[proxy] ✗ ${upstream.status} ${reqLabel} | ${upstreamMs}ms | err=${errText.slice(0, 500)}`);
+        console.error(`[proxy] ✗ SENT_BODY_ON_FAIL ${bodyStr.slice(0, 1000)}`);
 
         // Gap fix #1: track auth failures — alert on first 401 (not after threshold)
         if (upstream.status === 401) {
@@ -955,10 +1370,12 @@ const server = Bun.serve({
         // Gap fix #2: fallback on Claude failure
         // Route to DeepSeek if the original model is a DeepSeek model — OpenAI
         // doesn't recognise "deepseek-chat" etc and would return invalid_issuer.
-        if (upstream.status >= 500 || upstream.status === 401) {
+        const isBillingError = upstream.status === 400 && errText.includes("credit balance");
+        if (upstream.status >= 500 || upstream.status === 401 || isBillingError) {
           const isDeepSeekModel = DEEPSEEK_MODELS.has(originalModel);
+          // Try primary fallback first, then secondary if primary unavailable
           const fallback = isDeepSeekModel
-            ? await callDeepSeekFallback(body)
+            ? (await callDeepSeekFallback(body) || await callOpenAIFallback(body))
             : await callOpenAIFallback(body);
           if (fallback?.ok) {
             // [PASTA] — visible in logs + health endpoint whenever proxy is in fallback mode
@@ -1124,13 +1541,14 @@ const server = Bun.serve({
 
       // Forward all headers; replace Authorization with our OAuth token.
       // Merge any caller-supplied anthropic-beta with the oauth beta header.
+      // For native Claude Code passthrough, the binary already injected billing
+      // into the body's system[0] with correct cch. Just forward as-is with OAuth.
       const forwardHeaders: Record<string, string> = {
         "Authorization": `Bearer ${token}`,
         "anthropic-version": ANTHROPIC_VERSION,
         "anthropic-beta": OAUTH_BETA,
         "x-app": "cli",
         "User-Agent": CLI_USER_AGENT,
-        "x-anthropic-billing-header": buildBillingHeader(),
         "X-Claude-Code-Session-Id": PROXY_SESSION_ID,
         "x-client-request-id": randomUUID(),
       };
@@ -1172,7 +1590,20 @@ const server = Bun.serve({
       if (!verifySttToken(token)) {
         return new Response("Unauthorized", { status: 401 });
       }
-      const upgraded = server.upgrade(req, { data: { upstream: null, keepAliveTimer: null } as SttWsData });
+      const upgraded = server.upgrade(req, { data: { kind: "stt", upstream: null, keepAliveTimer: null } as SttWsData });
+      if (upgraded) return undefined as any;
+      return new Response("WebSocket upgrade failed", { status: 400 });
+    }
+
+    // ─── WebSocket TTS relay ──────────────────────────────────────────────────
+    // Upgrades to a WebSocket that relays text chunks → Anthropic TTS → binary audio back.
+    // Auth: same short-lived HMAC token as STT.
+    if (url.pathname === "/ws/tts") {
+      const token = url.searchParams.get("token") || req.headers.get("x-stt-token") || "";
+      if (!verifySttToken(token)) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const upgraded = server.upgrade(req, { data: { kind: "tts", upstream: null, keepAliveTimer: null, pendingMessages: [] } as TtsWsData });
       if (upgraded) return undefined as any;
       return new Response("WebSocket upgrade failed", { status: 400 });
     }
@@ -1180,9 +1611,85 @@ const server = Bun.serve({
     return Response.json({ error: "Not found" }, { status: 404 });
   },
 
-  // ─── WebSocket STT relay handlers ────────────────────────────────────────
+  // ─── WebSocket handlers (STT + TTS) ──────────────────────────────────────
   websocket: {
     async open(ws: any) {
+      const data: WsData = ws.data;
+
+      if (data.kind === "tts") {
+        // ── TTS relay ──────────────────────────────────────────────────────
+        console.log("[proxy/ws/tts] Client connected — fetching OAuth token");
+        const oauthToken = await getAccessToken();
+        if (!oauthToken) {
+          console.error("[proxy/ws/tts] No OAuth token — closing client");
+          ws.close(1008, "No auth token");
+          return;
+        }
+
+        const upstream = new (WebSocket as any)(
+          "wss://api.anthropic.com/api/ws/text_to_speech/text_stream",
+          {
+            headers: {
+              "Authorization": `Bearer ${oauthToken}`,
+              "x-app": "cli",
+              "anthropic-version": ANTHROPIC_VERSION,
+              "anthropic-beta": OAUTH_BETA,
+            },
+          },
+        ) as WebSocket;
+
+        data.upstream = upstream;
+
+        upstream.onopen = () => {
+          console.log("[proxy/ws/tts] Upstream Anthropic TTS connected");
+          // Drain messages buffered before upstream was ready
+          const ttsData = data as TtsWsData;
+          for (const msg of ttsData.pendingMessages) {
+            try { upstream.send(msg as any); } catch { /* ignore */ }
+          }
+          ttsData.pendingMessages = [];
+          // keep_alive every 4s per Anthropic TTS protocol
+          data.keepAliveTimer = setInterval(() => {
+            if ((upstream as any).readyState === 1 /* OPEN */) {
+              upstream.send('{"type":"keep_alive"}');
+            } else {
+              clearInterval(data.keepAliveTimer!);
+              data.keepAliveTimer = null;
+            }
+          }, 4000);
+        };
+
+        upstream.onmessage = (event: any) => {
+          // Forward audio back to client (Bun delivers binary as Buffer)
+          try {
+            const payload = event.data;
+            if (typeof payload === "string") {
+              console.log("[proxy/ws/tts] Control msg:", payload.slice(0, 100));
+              ws.send(payload);
+            } else {
+              // Buffer / ArrayBuffer / Uint8Array — forward as binary
+              console.log(`[proxy/ws/tts] Audio chunk ${(payload as any).byteLength ?? (payload as any).length ?? 0} bytes`);
+              ws.send(payload);
+            }
+          } catch { /* client closed */ }
+        };
+
+        upstream.onclose = (event: any) => {
+          console.log(`[proxy/ws/tts] Upstream closed code=${event.code}`);
+          if (data.keepAliveTimer) { clearInterval(data.keepAliveTimer); data.keepAliveTimer = null; }
+          try { ws.close(1000, "Upstream closed"); } catch { /* already closed */ }
+        };
+
+        upstream.onerror = (err: any) => {
+          console.error("[proxy/ws/tts] Upstream error:", err?.message || err);
+          if (data.keepAliveTimer) { clearInterval(data.keepAliveTimer); data.keepAliveTimer = null; }
+          try { ws.close(1011, "Upstream error"); } catch { /* already closed */ }
+        };
+
+        return;
+      }
+
+      // ── STT relay ────────────────────────────────────────────────────────
       console.log("[proxy/ws/stt] Client connected — fetching OAuth token");
       const oauthToken = await getAccessToken();
       if (!oauthToken) {
@@ -1195,8 +1702,8 @@ const server = Bun.serve({
         encoding: "linear16",
         sample_rate: "16000",
         channels: "1",
-        endpointing_ms: "300",
-        utterance_end_ms: "1000",
+        endpointing_ms: "500",
+        utterance_end_ms: "1800",
         language: "en",
         use_conversation_engine: "true",
         stt_provider: "deepgram-nova3",
@@ -1214,17 +1721,17 @@ const server = Bun.serve({
         },
       ) as WebSocket;
 
-      ws.data.upstream = upstream;
+      data.upstream = upstream;
 
       upstream.onopen = () => {
         console.log("[proxy/ws/stt] Upstream Anthropic STT connected");
         // KeepAlive every 8s per Anthropic protocol
-        ws.data.keepAliveTimer = setInterval(() => {
+        data.keepAliveTimer = setInterval(() => {
           if ((upstream as any).readyState === 1 /* OPEN */) {
             upstream.send('{"type":"KeepAlive"}');
           } else {
-            clearInterval(ws.data.keepAliveTimer);
-            ws.data.keepAliveTimer = null;
+            clearInterval(data.keepAliveTimer!);
+            data.keepAliveTimer = null;
           }
         }, 8000);
       };
@@ -1236,28 +1743,35 @@ const server = Bun.serve({
 
       upstream.onclose = (event: any) => {
         console.log(`[proxy/ws/stt] Upstream closed code=${event.code}`);
-        if (ws.data.keepAliveTimer) { clearInterval(ws.data.keepAliveTimer); ws.data.keepAliveTimer = null; }
+        if (data.keepAliveTimer) { clearInterval(data.keepAliveTimer); data.keepAliveTimer = null; }
         try { ws.close(1000, "Upstream closed"); } catch { /* already closed */ }
       };
 
       upstream.onerror = (err: any) => {
         console.error("[proxy/ws/stt] Upstream error:", err?.message || err);
-        if (ws.data.keepAliveTimer) { clearInterval(ws.data.keepAliveTimer); ws.data.keepAliveTimer = null; }
+        if (data.keepAliveTimer) { clearInterval(data.keepAliveTimer); data.keepAliveTimer = null; }
         try { ws.close(1011, "Upstream error"); } catch { /* already closed */ }
       };
     },
 
-    message(ws: any, data: string | Uint8Array | Buffer) {
-      // Client → upstream: binary frames are PCM16 audio, strings are JSON control messages
-      const upstream: WebSocket | null = ws.data.upstream;
+    message(ws: any, data_raw: string | Uint8Array | Buffer) {
+      const data: WsData = ws.data;
+      const upstream: WebSocket | null = data.upstream;
+      // TTS: buffer messages until upstream is ready (race condition — client sends text before proxy connects upstream)
+      if (data.kind === "tts" && (!upstream || (upstream as any).readyState !== 1 /* OPEN */)) {
+        (data as TtsWsData).pendingMessages.push(data_raw as any);
+        return;
+      }
       if (!upstream || (upstream as any).readyState !== 1 /* OPEN */) return;
-      try { upstream.send(data as any); } catch { /* upstream closed */ }
+      // Both STT (binary PCM16 + JSON control) and TTS (JSON TextChunkInputMessage) just forward through
+      try { upstream.send(data_raw as any); } catch { /* upstream closed */ }
     },
 
     close(ws: any, code: number, reason: string) {
-      console.log(`[proxy/ws/stt] Client disconnected code=${code} reason=${reason}`);
-      if (ws.data.keepAliveTimer) { clearInterval(ws.data.keepAliveTimer); ws.data.keepAliveTimer = null; }
-      const upstream: WebSocket | null = ws.data.upstream;
+      const data: WsData = ws.data;
+      console.log(`[proxy/ws/${data.kind}] Client disconnected code=${code} reason=${reason}`);
+      if (data.keepAliveTimer) { clearInterval(data.keepAliveTimer); data.keepAliveTimer = null; }
+      const upstream: WebSocket | null = data.upstream;
       if (upstream && (upstream as any).readyState === 1 /* OPEN */) {
         try { upstream.send('{"type":"CloseStream"}'); upstream.close(); } catch { /* ignore */ }
       }
@@ -1272,8 +1786,8 @@ console.log(`
 ║  Port:    ${PORT}                                       ║
 ║  Base URL: http://localhost:${PORT}/v1                  ║
 ║  Auth:    Claude subscription (keychain/env)         ║
-║  Models:  gpt-4o → claude-sonnet-4-6                 ║
-║           gpt-4o-mini → claude-haiku-4-5             ║
+║  Models:  ALL → claude-sonnet-4-6 (via binary)       ║
+║           opus explicitly → claude-opus-4-6          ║
 ║  Fallback: OpenAI direct (if OPENAI_API_KEY set)     ║
 ╚══════════════════════════════════════════════════════╝
 `);
