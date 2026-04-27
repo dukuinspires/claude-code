@@ -1,0 +1,904 @@
+/**
+ * DeepSeek Web Proxy — Token Pool Edition
+ *
+ * Maintains a pool of DeepSeek accounts. On 40003 (expired/invalid token),
+ * immediately rotates to the next active account — no re-login delay,
+ * no downtime. Background re-login refreshes cooled accounts back into rotation.
+ *
+ * Pool is hot-reloadable via POST /admin/reload-pool (no restart needed).
+ *
+ * Env:
+ *   DS_PROXY_PORT      — port (default 3098)
+ *   DS_POOL_JSON       — JSON array of {token,email,password,dliq,leim} for initial pool
+ *   INTERNAL_AUTH_TOKEN — admin endpoint auth
+ *   SMARTASSIST_URL    — for persisting tokens back to SmartAssist after re-login
+ *   VPS_PROXY_URL      — VPS base URL for routing login calls through clean IP
+ *   SMTP_PROXY_SECRET  — auth secret for VPS /ds-proxy endpoint
+ */
+
+import { readFileSync } from "fs";
+
+const PORT = process.env.DS_PROXY_PORT ? parseInt(process.env.DS_PROXY_PORT) : 3098;
+const DS_API = "https://chat.deepseek.com";
+const INTERNAL_TOKEN = process.env.INTERNAL_AUTH_TOKEN || "";
+
+// ─── Request counter for access logging ──────────────────────────────────────
+let requestCount = 0;
+
+function reqId() {
+  return `req-${++requestCount}`;
+}
+
+// ─── GCP identity token for Cloud Run → SmartAssist callbacks ─────────────────
+let _saTokenCache: { token: string; expiresAt: number } | null = null;
+async function getSmartAssistIdToken(): Promise<string | null> {
+  if (!process.env.K_SERVICE) return null; // local dev — no auth needed
+  const saUrl = process.env.SMARTASSIST_URL || "";
+  if (!saUrl) return null;
+  const now = Date.now();
+  if (_saTokenCache && _saTokenCache.expiresAt > now + 60_000) {
+    console.log("[ds-proxy] [gcp-token] using cached identity token");
+    return _saTokenCache.token;
+  }
+  try {
+    console.log("[ds-proxy] [gcp-token] fetching new identity token from metadata server");
+    const res = await fetch(
+      `http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=${encodeURIComponent(saUrl)}`,
+      { headers: { "Metadata-Flavor": "Google" } }
+    );
+    if (!res.ok) {
+      console.warn(`[ds-proxy] [gcp-token] metadata server returned HTTP ${res.status}`);
+      return null;
+    }
+    const token = await res.text();
+    _saTokenCache = { token, expiresAt: now + 50 * 60_000 };
+    console.log(`[ds-proxy] [gcp-token] ✓ obtained (${token.length} chars, expires in 50min)`);
+    return token;
+  } catch (e: any) {
+    console.warn(`[ds-proxy] [gcp-token] ✗ failed: ${e.message}`);
+    return null;
+  }
+}
+
+// ─── Account pool ─────────────────────────────────────────────────────────────
+
+// Proactive throttle: max requests per account in a sliding window
+const THROTTLE_WINDOW_MS = 60_000;  // 1 minute window
+const THROTTLE_MAX_REQ   = 10;      // max requests per account per window
+
+interface PoolAccount {
+  token: string;
+  email?: string;
+  password?: string;  // stored encrypted in DB, decrypted before loading into pool
+  dliq?: string;
+  leim?: string;
+  status: "active" | "cooling" | "dead";
+  failureCount: number;
+  lastUsed: number;
+  coolingUntil?: number;
+  // Sliding window request timestamps for proactive throttle
+  recentRequests: number[];
+  // Token lifecycle tracking — learn actual TTL from 40003 expiry events
+  tokenObtainedAt?: number;
+}
+
+// ─── Token lifetime tracking ─────────────────────────────────────────────────
+// Records observed token lifetimes (ms) when 40003 fires. Over time, the median
+// tells us the actual TTL so we can proactively refresh before expiry.
+const tokenLifetimeObservations: number[] = [];
+
+function recordTokenExpiry(acc: PoolAccount) {
+  if (!acc.tokenObtainedAt) return;
+  const lifetimeMs = Date.now() - acc.tokenObtainedAt;
+  const lifetimeH = (lifetimeMs / 3_600_000).toFixed(1);
+  tokenLifetimeObservations.push(lifetimeMs);
+  // Keep last 50 observations
+  if (tokenLifetimeObservations.length > 50) tokenLifetimeObservations.shift();
+  const medianMs = tokenLifetimeObservations.length > 0
+    ? tokenLifetimeObservations.slice().sort((a, b) => a - b)[Math.floor(tokenLifetimeObservations.length / 2)]
+    : null;
+  const medianH = medianMs ? (medianMs / 3_600_000).toFixed(1) : "?";
+  console.log(`[ds-proxy] [token-ttl] ${acc.email || "??"}: token expired after ${lifetimeH}h | observations=${tokenLifetimeObservations.length} median=${medianH}h`);
+}
+
+let pool: PoolAccount[] = [];
+let poolIndex = 0;
+
+function poolSummary() {
+  return {
+    total: pool.length,
+    active: pool.filter(a => a.status === "active").length,
+    cooling: pool.filter(a => a.status === "cooling").length,
+    dead: pool.filter(a => a.status === "dead").length,
+  };
+}
+
+function initPoolFromEnv() {
+  console.log("[ds-proxy] [init] ── initPoolFromEnv ──────────────────────────");
+  console.log(`[ds-proxy] [init]   DS_POOL_JSON       = ${process.env.DS_POOL_JSON ? `set (${process.env.DS_POOL_JSON.length} chars)` : "unset"}`);
+  console.log(`[ds-proxy] [init]   DS_USER_TOKEN      = ${process.env.DS_USER_TOKEN ? "set" : "unset"}`);
+  console.log(`[ds-proxy] [init]   SMARTASSIST_URL    = ${process.env.SMARTASSIST_URL || "unset"}`);
+  console.log(`[ds-proxy] [init]   INTERNAL_AUTH_TOKEN= ${process.env.INTERNAL_AUTH_TOKEN ? "set" : "unset"}`);
+  console.log(`[ds-proxy] [init]   VPS_PROXY_URL      = ${process.env.VPS_PROXY_URL || "unset"}`);
+  console.log(`[ds-proxy] [init]   SMTP_PROXY_SECRET  = ${process.env.SMTP_PROXY_SECRET ? "set" : "unset"}`);
+  console.log(`[ds-proxy] [init]   K_SERVICE          = ${process.env.K_SERVICE || "unset (local)"}`);
+
+  // Bootstrap from DS_POOL_JSON env (JSON array loaded by SmartAssist on startup)
+  try {
+    const raw = process.env.DS_POOL_JSON;
+    if (raw) {
+      const accounts = JSON.parse(raw) as any[];
+      console.log(`[ds-proxy] [init] DS_POOL_JSON parsed — ${accounts.length} entry(s)`);
+      pool = accounts.map(a => ({
+        token: a.token || "",
+        email: a.email,
+        password: a.password,
+        dliq: a.dliq || a.hif_dliq,
+        leim: a.leim || a.hif_leim,
+        status: a.token ? "active" : "cooling" as any,
+        failureCount: 0,
+        lastUsed: 0,
+        recentRequests: [],
+        tokenObtainedAt: a.token_obtained_at ? new Date(a.token_obtained_at).getTime() : Date.now(),
+      }));
+      const active = pool.filter(a => a.status === "active").length;
+      console.log(`[ds-proxy] [init] ✓ Loaded ${pool.length} account(s) from DS_POOL_JSON (${active} active)`);
+      pool.forEach(a => console.log(
+        `[ds-proxy] [init]   • ${a.email || "unknown"} | status=${a.status} | hasToken=${!!a.token} | hasDliq=${!!a.dliq} | hasLeim=${!!a.leim} | hasPassword=${!!a.password}`
+      ));
+      return;
+    }
+  } catch (e) {
+    console.error("[ds-proxy] [init] ✗ Failed to parse DS_POOL_JSON:", e);
+  }
+
+  // Fallback: single-account mode from legacy env vars
+  const token = process.env.DS_USER_TOKEN || "";
+  if (token) {
+    pool = [{
+      token,
+      email: process.env.DS_EMAIL,
+      password: process.env.DS_PASSWORD,
+      dliq: process.env.DS_HIF_DLIQ,
+      leim: process.env.DS_HIF_LEIM,
+      status: "active",
+      failureCount: 0,
+      lastUsed: 0,
+      recentRequests: [],
+    }];
+    console.log(`[ds-proxy] [init] ✓ Loaded 1 account from DS_USER_TOKEN (email=${process.env.DS_EMAIL || "unknown"})`);
+  } else {
+    console.warn("[ds-proxy] [init] ⚠ No DS_POOL_JSON or DS_USER_TOKEN — pool empty until SmartAssist sync");
+  }
+}
+
+initPoolFromEnv();
+
+/** On startup: if pool is empty, pull stored tokens from SmartAssist automatically.
+ *  This is the primary bootstrap path — no env vars needed. */
+async function syncPoolFromSmartAssist() {
+  const saUrl = process.env.SMARTASSIST_URL || "";
+  const internalTok = process.env.INTERNAL_AUTH_TOKEN || "";
+  console.log(`[ds-proxy] [sync] ── syncPoolFromSmartAssist ──────────────────`);
+  console.log(`[ds-proxy] [sync]   saUrl=${saUrl || "unset"} internalTok=${internalTok ? "set" : "unset"}`);
+
+  if (!saUrl) {
+    console.warn("[ds-proxy] [sync] ⚠ SMARTASSIST_URL not set — cannot auto-sync pool");
+    return;
+  }
+  if (!internalTok) {
+    console.warn("[ds-proxy] [sync] ⚠ INTERNAL_AUTH_TOKEN not set — cannot authenticate to SmartAssist");
+    return;
+  }
+
+  const syncUrl = `${saUrl}/api/webhooks/ds-proxy-sync`;
+  console.log(`[ds-proxy] [sync] calling ${syncUrl} …`);
+
+  try {
+    const t0 = Date.now();
+    const idToken = await getSmartAssistIdToken();
+    console.log(`[ds-proxy] [sync] GCP identity token: ${idToken ? `obtained (${idToken.length} chars)` : "not available (local dev)"}`);
+
+    const res = await fetch(syncUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-internal-token": internalTok,
+        ...(idToken ? { "Authorization": `Bearer ${idToken}` } : {}),
+      },
+    });
+    const elapsed = Date.now() - t0;
+    console.log(`[ds-proxy] [sync] SmartAssist responded HTTP ${res.status} in ${elapsed}ms`);
+
+    if (res.ok) {
+      const data = await res.json() as any;
+      console.log(`[ds-proxy] [sync] ✓ result: ${JSON.stringify(data)}`);
+      const s = poolSummary();
+      console.log(`[ds-proxy] [sync] pool after sync — total=${s.total} active=${s.active} cooling=${s.cooling} dead=${s.dead}`);
+    } else {
+      const body = await res.text().catch(() => "");
+      console.warn(`[ds-proxy] [sync] ⚠ HTTP ${res.status} — starting with empty pool. Body: ${body.slice(0, 300)}`);
+    }
+  } catch (e: any) {
+    console.warn(`[ds-proxy] [sync] ⚠ sync failed (non-fatal): ${e.message}`);
+  }
+}
+
+// Bootstrap: sync from SmartAssist if pool is empty after env init
+const poolIsEmpty = pool.length === 0 || pool.every(a => !a.token);
+console.log(`[ds-proxy] [init] post-init pool — size=${pool.length} empty=${poolIsEmpty}`);
+if (poolIsEmpty) {
+  console.log("[ds-proxy] [init] pool empty — triggering SmartAssist auto-sync");
+  syncPoolFromSmartAssist();
+} else {
+  console.log(`[ds-proxy] [init] pool has ${pool.length} account(s) — skipping auto-sync`);
+}
+
+/** Prune old timestamps and return current request count in the sliding window */
+function windowCount(acc: PoolAccount): number {
+  const cutoff = Date.now() - THROTTLE_WINDOW_MS;
+  acc.recentRequests = acc.recentRequests.filter(t => t > cutoff);
+  return acc.recentRequests.length;
+}
+
+/** Record a request against an account's sliding window */
+function recordRequest(acc: PoolAccount) {
+  acc.recentRequests.push(Date.now());
+}
+
+/** Pick the next active account from the pool (LRU, skips cooling/dead/throttled) */
+function pickAccount(): PoolAccount | null {
+  const now = Date.now();
+
+  // Thaw any accounts whose cooling period has ended
+  for (const acc of pool) {
+    if (acc.status === "cooling" && acc.coolingUntil && now >= acc.coolingUntil) {
+      acc.status = "active";
+      acc.coolingUntil = undefined;
+      console.log(`[ds-proxy] [pool] ♻ Thawed ${acc.email || "??"} back to active (failures=${acc.failureCount})`);
+    }
+  }
+
+  // Active accounts that are under the proactive throttle threshold
+  const actives = pool.filter(a => a.status === "active" && a.token && windowCount(a) < THROTTLE_MAX_REQ);
+  if (!actives.length) {
+    // All active accounts are throttled — fall back to least-loaded even if over threshold
+    const anyActive = pool.filter(a => a.status === "active" && a.token);
+    if (!anyActive.length) {
+      const s = poolSummary();
+      console.warn(`[ds-proxy] [pool] ✗ no active accounts — total=${s.total} cooling=${s.cooling} dead=${s.dead}`);
+      return null;
+    }
+    anyActive.sort((a, b) => windowCount(a) - windowCount(b));
+    console.warn(`[ds-proxy] [pool] ⚠ all accounts at throttle limit — using least-loaded: ${anyActive[0].email || "??"} (${windowCount(anyActive[0])} req/min)`);
+    return anyActive[0];
+  }
+
+  // Prefer least-recently-used among unthrottled accounts
+  actives.sort((a, b) => a.lastUsed - b.lastUsed);
+  return actives[0];
+}
+
+/** Mark an account as cooling (token expired). Cool for 10 minutes then retry. */
+function coolAccount(acc: PoolAccount) {
+  recordTokenExpiry(acc); // Track how long the token lasted
+  acc.status = "cooling";
+  acc.failureCount++;
+  acc.coolingUntil = Date.now() + 10 * 60 * 1000;
+  const s = poolSummary();
+  const ageH = acc.tokenObtainedAt ? ((Date.now() - acc.tokenObtainedAt) / 3_600_000).toFixed(1) + "h" : "?";
+  console.log(`[ds-proxy] [pool] ❄ Cooled ${acc.email || "??"} for 10min (failures=${acc.failureCount} tokenAge=${ageH}) — pool: active=${s.active} cooling=${s.cooling} dead=${s.dead}`);
+
+  // Trigger background re-login if credentials available
+  if (acc.email && acc.password) {
+    console.log(`[ds-proxy] [pool] → triggering background re-login for ${acc.email}`);
+    reloginAccount(acc).catch(() => {});
+  } else {
+    console.warn(`[ds-proxy] [pool] ⚠ ${acc.email || "??"} has no stored password — cannot auto re-login`);
+  }
+}
+
+// ─── VPS fetch helper — routes DeepSeek API calls through clean IP ───────────
+//
+// Login/re-login calls from Cloud Run trigger RISK_DEVICE_DETECTED (biz_code=11)
+// because Cloud Run egress IPs are flagged. Route them through the VPS instead.
+
+async function vdsFetch(path: string, init: { method: string; headers: Record<string, string>; body: string }): Promise<Response> {
+  const vpsUrl = process.env.VPS_PROXY_URL || "";
+  const secret = process.env.SMTP_PROXY_SECRET || "";
+
+  if (vpsUrl) {
+    const t0 = Date.now();
+    console.log(`[ds-proxy] [vps-fetch] → ${init.method} ${path} via VPS ${vpsUrl}`);
+    try {
+      const res = await fetch(`${vpsUrl}/ds-proxy`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-smtp-proxy-secret": secret,
+        },
+        body: JSON.stringify({ path, method: init.method, headers: init.headers, body: init.body }),
+      });
+      const elapsed = Date.now() - t0;
+      if (res.ok) {
+        const json = await res.json() as any;
+        console.log(`[ds-proxy] [vps-fetch] ✓ VPS responded in ${elapsed}ms → upstream status=${json.status}`);
+        return new Response(json.body, { status: json.status });
+      }
+      console.warn(`[ds-proxy] [vps-fetch] ⚠ VPS HTTP ${res.status} in ${elapsed}ms — falling back to direct`);
+    } catch (e: any) {
+      console.warn(`[ds-proxy] [vps-fetch] ⚠ VPS error: ${e.message} — falling back to direct`);
+    }
+  } else {
+    console.warn(`[ds-proxy] [vps-fetch] VPS_PROXY_URL not set — calling DeepSeek directly (may trigger RISK_DEVICE_DETECTED)`);
+  }
+
+  // Fallback: direct (local dev or VPS unavailable)
+  console.log(`[ds-proxy] [vps-fetch] → ${init.method} ${path} direct to DeepSeek`);
+  return fetch(`${DS_API}${path}`, { method: init.method, headers: init.headers, body: init.body });
+}
+
+// ─── DeepSeek login ───────────────────────────────────────────────────────────
+
+async function loginDeepSeek(email: string, password: string, deviceId?: string): Promise<string | null> {
+  const did = deviceId || `sa-proxy-${email.replace(/[^a-z0-9]/gi, "").slice(0, 12)}`;
+  console.log(`[ds-proxy] [login] attempting login for ${email} (deviceId=${did})`);
+  try {
+    const headers = {
+      "content-type": "application/json",
+      "x-app-version": "20241129.1",
+      "x-client-platform": "web",
+      "x-client-version": "1.8.0",
+      "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36",
+      "origin": "https://chat.deepseek.com",
+      "referer": "https://chat.deepseek.com/",
+    };
+    const body = JSON.stringify({ email, password, device_id: did, os: "web" });
+    const res = await vdsFetch("/api/v0/users/login", { method: "POST", headers, body });
+    const data = await res.json() as any;
+    const token = data?.data?.biz_data?.user?.token ?? null;
+    const bizCode = data?.code ?? data?.data?.code;
+    const bizMsg = data?.data?.biz_msg ?? data?.message ?? "";
+    console.log(`[ds-proxy] [login] ${email} — bizCode=${bizCode} bizMsg=${bizMsg} hasToken=${!!token}`);
+    if (bizCode === 11) console.error(`[ds-proxy] [login] ✗ RISK_DEVICE_DETECTED for ${email} — VPS IP may be flagged`);
+    return token;
+  } catch (e: any) {
+    console.error(`[ds-proxy] [login] ✗ threw for ${email}: ${e.message}`);
+    return null;
+  }
+}
+
+async function reloginAccount(acc: PoolAccount) {
+  if (!acc.email || !acc.password) return;
+  console.log(`[ds-proxy] [relogin] 🔑 re-logging in ${acc.email} (failures=${acc.failureCount})`);
+  const t0 = Date.now();
+  const newToken = await loginDeepSeek(acc.email, acc.password);
+  const elapsed = Date.now() - t0;
+
+  if (newToken) {
+    acc.token = newToken;
+    acc.status = "active";
+    acc.failureCount = 0;
+    acc.coolingUntil = undefined;
+    acc.tokenObtainedAt = Date.now();
+    console.log(`[ds-proxy] [relogin] ✓ re-login succeeded for ${acc.email} in ${elapsed}ms`);
+
+    // Persist back to SmartAssist
+    const saUrl = process.env.SMARTASSIST_URL || "";
+    const internalTok = process.env.INTERNAL_AUTH_TOKEN || "";
+    if (saUrl && internalTok) {
+      console.log(`[ds-proxy] [relogin] persisting new token for ${acc.email} → SmartAssist`);
+      getSmartAssistIdToken().then(idToken => {
+        fetch(`${saUrl}/api/admin/deepseek-proxy/reload-tokens`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-internal-token": internalTok,
+            ...(idToken ? { "Authorization": `Bearer ${idToken}` } : {}),
+          },
+          body: JSON.stringify({ token: newToken, email: acc.email }),
+        })
+          .then(r => console.log(`[ds-proxy] [relogin] SmartAssist token persist HTTP ${r.status} for ${acc.email}`))
+          .catch(e => console.error(`[ds-proxy] [relogin] ✗ SmartAssist persist failed for ${acc.email}: ${e.message}`));
+      });
+    } else {
+      console.warn(`[ds-proxy] [relogin] ⚠ SMARTASSIST_URL or INTERNAL_AUTH_TOKEN not set — new token not persisted for ${acc.email}`);
+    }
+  } else {
+    console.error(`[ds-proxy] [relogin] ✗ re-login failed for ${acc.email} in ${elapsed}ms (failures now=${acc.failureCount})`);
+    if (acc.failureCount >= 3) {
+      acc.status = "dead";
+      console.error(`[ds-proxy] [relogin] 💀 ${acc.email} marked dead after ${acc.failureCount} failures`);
+    }
+  }
+}
+
+// ─── Load WASM PoW solver ─────────────────────────────────────────────────────
+const wasmPath = process.env.DS_WASM_PATH || new URL("./deepseek-wasm/sha3_wasm_bg.wasm", import.meta.url).pathname;
+console.log(`[ds-proxy] [wasm] loading from ${wasmPath}`);
+const wasmBytes = readFileSync(wasmPath);
+const { instance: wasmInstance } = await WebAssembly.instantiate(wasmBytes);
+console.log(`[ds-proxy] [wasm] ✓ loaded (${wasmBytes.length} bytes)`);
+const {
+  wasm_solve,
+  __wbindgen_add_to_stack_pointer,
+  __wbindgen_export_0: wasm_malloc,
+  memory: wasmMemory,
+} = wasmInstance.exports as any;
+
+const enc = new TextEncoder();
+let _wasmVecLen = 0;
+
+function passStrToWasm(str: string): number {
+  const buf = enc.encode(str);
+  const ptr = wasm_malloc(buf.length, 1);
+  new Uint8Array(wasmMemory.buffer).set(buf, ptr);
+  _wasmVecLen = buf.length;
+  return ptr;
+}
+
+function solvePoW(challenge: string, salt: string, difficulty: number, expireAt: number): number | null {
+  const prefix = `${salt}_${expireAt}_`;
+  const retptr = __wbindgen_add_to_stack_pointer(-16);
+  const challengePtr = passStrToWasm(challenge);
+  const challengeLen = _wasmVecLen;
+  const prefixPtr = passStrToWasm(prefix);
+  const prefixLen = _wasmVecLen;
+  try {
+    wasm_solve(retptr, challengePtr, challengeLen, prefixPtr, prefixLen, difficulty);
+    const view = new DataView(wasmMemory.buffer);
+    const ok = view.getInt32(retptr, true);
+    const answer = view.getFloat64(retptr + 8, true);
+    return ok !== 0 ? answer : null;
+  } finally {
+    __wbindgen_add_to_stack_pointer(16);
+  }
+}
+
+// ─── PoW challenge fetch + solve ─────────────────────────────────────────────
+async function getPowResponse(targetPath: string, token: string): Promise<string | null> {
+  const t0 = Date.now();
+  try {
+    const res = await fetch(`${DS_API}/api/v0/chat/create_pow_challenge`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "authorization": `Bearer ${token}`,
+        "x-app-version": "20241129.1",
+        "x-client-platform": "web",
+        "x-client-version": "1.8.0",
+      },
+      body: JSON.stringify({ target_path: targetPath }),
+    });
+    const data = await res.json() as any;
+    const ch = data?.data?.biz_data?.challenge;
+    if (!ch) {
+      console.warn(`[ds-proxy] [pow] ⚠ no challenge in response for ${targetPath} (HTTP ${res.status})`);
+      return null;
+    }
+    const { algorithm, challenge, salt, difficulty, expire_at, signature } = ch;
+    const answer = solvePoW(challenge, salt, difficulty, expire_at);
+    if (answer === null) {
+      console.warn(`[ds-proxy] [pow] ⚠ WASM solver returned null for ${targetPath}`);
+      return null;
+    }
+    console.log(`[ds-proxy] [pow] ✓ solved ${targetPath} in ${Date.now() - t0}ms (difficulty=${difficulty})`);
+    return btoa(JSON.stringify({ algorithm, challenge, salt, answer, signature, target_path: targetPath }));
+  } catch (e: any) {
+    console.error(`[ds-proxy] [pow] ✗ threw for ${targetPath}: ${e.message}`);
+    return null;
+  }
+}
+
+// ─── Request headers ──────────────────────────────────────────────────────────
+function dsHeaders(acc: PoolAccount, powResponse?: string | null): Record<string, string> {
+  const h: Record<string, string> = {
+    "authorization": `Bearer ${acc.token}`,
+    "content-type": "application/json",
+    "x-app-version": "20241129.1",
+    "x-client-platform": "web",
+    "x-client-version": "1.8.0",
+    "x-client-locale": "en_US",
+    "x-client-timezone-offset": "36000",
+    "referer": "https://chat.deepseek.com/",
+    "origin": "https://chat.deepseek.com",
+    "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36",
+  };
+  if (acc.dliq) h["x-hif-dliq"] = acc.dliq;
+  if (acc.leim) h["x-hif-leim"] = acc.leim;
+  if (powResponse) h["x-ds-pow-response"] = powResponse;
+  return h;
+}
+
+// ─── OpenAI → DeepSeek body ───────────────────────────────────────────────────
+function openAIToDS(body: any, sessionId: string) {
+  const messages = body.messages || [];
+  const lastUser = [...messages].reverse().find((m: any) => m.role === "user");
+  const prompt = typeof lastUser?.content === "string"
+    ? lastUser.content
+    : Array.isArray(lastUser?.content)
+      ? lastUser.content.map((b: any) => b.text || "").join("")
+      : "";
+  return { chat_session_id: sessionId, parent_message_id: null, prompt, ref_file_ids: [], thinking_enabled: false, search_enabled: false };
+}
+
+// ─── Check for expired-token error code ──────────────────────────────────────
+async function isExpiredToken(res: Response): Promise<{ expired: boolean; text: string }> {
+  const text = await res.text();
+  try {
+    const j = JSON.parse(text) as any;
+    const code = j?.code ?? j?.error?.code ?? j?.data?.code;
+    if (code === 40003 || code === "40003") return { expired: true, text };
+  } catch { /* not JSON */ }
+  if (text.includes("40003")) return { expired: true, text };
+  return { expired: false, text };
+}
+
+// ─── Core completion (one attempt with a given account) ───────────────────────
+async function doCompletion(body: any, acc: PoolAccount, rid: string) {
+  console.log(`[ds-proxy] [completion] [${rid}] creating session for ${acc.email || "??"}`);
+  const t0 = Date.now();
+  const sessionRes = await fetch(`${DS_API}/api/v0/chat_session/create`, {
+    method: "POST",
+    headers: dsHeaders(acc),
+    body: JSON.stringify({ agent: "chat", character_id: null }),
+  });
+  const sessionData = await sessionRes.json() as any;
+  const sessionId = sessionData?.data?.biz_data?.chat_session?.id;
+  if (!sessionId) {
+    console.error(`[ds-proxy] [completion] [${rid}] ✗ session create failed HTTP ${sessionRes.status}: ${JSON.stringify(sessionData).slice(0, 200)}`);
+    throw new Error(`Session create failed: ${JSON.stringify(sessionData).slice(0, 200)}`);
+  }
+  console.log(`[ds-proxy] [completion] [${rid}] session=${sessionId} (${Date.now() - t0}ms)`);
+
+  const pow = await getPowResponse("/api/v0/chat/completion", acc.token);
+  console.log(`[ds-proxy] [completion] [${rid}] PoW=${pow ? "solved" : "skipped"} — calling /chat/completion`);
+
+  const upstream = await fetch(`${DS_API}/api/v0/chat/completion`, {
+    method: "POST",
+    headers: dsHeaders(acc, pow),
+    body: JSON.stringify(openAIToDS(body, sessionId)),
+  });
+  console.log(`[ds-proxy] [completion] [${rid}] upstream HTTP ${upstream.status} (${Date.now() - t0}ms total)`);
+
+  return { upstream, sessionId, pow };
+}
+
+// ─── Notify SmartAssist when pool is exhausted ────────────────────────────────
+let lastExhaustedNotify = 0;
+
+function notifyPoolExhausted() {
+  const now = Date.now();
+  if (now - lastExhaustedNotify < 5 * 60 * 1000) {
+    console.log("[ds-proxy] [exhausted] debounce active — skipping notify");
+    return;
+  }
+  lastExhaustedNotify = now;
+
+  const saUrl = process.env.SMARTASSIST_URL || "";
+  const internalTok = process.env.INTERNAL_AUTH_TOKEN || "";
+  if (!saUrl) {
+    console.warn("[ds-proxy] [exhausted] SMARTASSIST_URL not set — cannot notify");
+    return;
+  }
+
+  const stats = poolSummary();
+  console.log(`[ds-proxy] [exhausted] 🚨 pool exhausted — notifying SmartAssist (total=${stats.total} active=${stats.active} cooling=${stats.cooling} dead=${stats.dead})`);
+
+  getSmartAssistIdToken().then(idToken => {
+    fetch(`${saUrl}/api/webhooks/deepseek-proxy`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(internalTok ? { "x-internal-token": internalTok } : {}),
+        ...(idToken ? { "Authorization": `Bearer ${idToken}` } : {}),
+      },
+      body: JSON.stringify({ reason: "pool_exhausted", pool: stats }),
+    })
+      .then(r => console.log(`[ds-proxy] [exhausted] SmartAssist notified HTTP ${r.status}`))
+      .catch(e => console.error(`[ds-proxy] [exhausted] ✗ notify failed: ${e.message}`));
+  });
+}
+
+// ─── Admin auth ───────────────────────────────────────────────────────────────
+function isAdmin(req: Request): boolean {
+  if (!INTERNAL_TOKEN) return true;
+  const h = req.headers.get("x-internal-token") || req.headers.get("authorization") || "";
+  return h === INTERNAL_TOKEN || h === `Bearer ${INTERNAL_TOKEN}`;
+}
+
+// ─── Server ───────────────────────────────────────────────────────────────────
+Bun.serve({
+  port: PORT,
+  idleTimeout: 255,
+
+  async fetch(req) {
+    const url = new URL(req.url);
+    const rid = reqId();
+    const t0 = Date.now();
+    console.log(`[ds-proxy] [${rid}] → ${req.method} ${url.pathname}`);
+
+    // ── Health ────────────────────────────────────────────────────────────────
+    if (url.pathname === "/health") {
+      const s = poolSummary();
+      console.log(`[ds-proxy] [${rid}] health — total=${s.total} active=${s.active} cooling=${s.cooling} dead=${s.dead}`);
+      return Response.json({ ok: true, port: PORT, pool: s });
+    }
+
+    // ── Admin: reload entire pool ─────────────────────────────────────────────
+    if (url.pathname === "/admin/reload-pool" && req.method === "POST") {
+      if (!isAdmin(req)) {
+        console.warn(`[ds-proxy] [${rid}] reload-pool — unauthorized`);
+        return Response.json({ error: "Unauthorized" }, { status: 401 });
+      }
+      const body = await req.json() as any;
+      const accounts: PoolAccount[] = (body.accounts || []).map((a: any) => ({
+        token: a.token || "",
+        email: a.email,
+        password: a.password,
+        dliq: a.dliq || a.hif_dliq,
+        leim: a.leim || a.hif_leim,
+        status: a.token ? "active" : "cooling",
+        failureCount: 0,
+        lastUsed: 0,
+        recentRequests: [],
+      }));
+      if (!accounts.length) return Response.json({ error: "accounts array required" }, { status: 400 });
+      const prev = poolSummary();
+      pool = accounts;
+      poolIndex = 0;
+      const next = poolSummary();
+      console.log(`[ds-proxy] [${rid}] 🔄 pool reloaded — before: total=${prev.total} active=${prev.active} | after: total=${next.total} active=${next.active}`);
+      pool.forEach(a => console.log(`[ds-proxy] [${rid}]   • ${a.email || "unknown"} | status=${a.status} | hasToken=${!!a.token} | hasDliq=${!!a.dliq}`));
+      return Response.json({ ok: true, total: next.total, active: next.active });
+    }
+
+    // ── Admin: hot-swap single token (legacy compat) ──────────────────────────
+    if (url.pathname === "/admin/reload-tokens" && req.method === "POST") {
+      if (!isAdmin(req)) {
+        console.warn(`[ds-proxy] [${rid}] reload-tokens — unauthorized`);
+        return Response.json({ error: "Unauthorized" }, { status: 401 });
+      }
+      const body = await req.json() as any;
+      if (!body.token) return Response.json({ error: "token required" }, { status: 400 });
+
+      const existing = pool.find(a => a.email === body.email);
+      if (existing) {
+        existing.token = body.token;
+        existing.status = "active";
+        existing.failureCount = 0;
+        existing.coolingUntil = undefined;
+        existing.tokenObtainedAt = Date.now();
+        if (body.dliq || body.hifDliq) existing.dliq = body.dliq || body.hifDliq;
+        if (body.leim || body.hifLeim) existing.leim = body.leim || body.hifLeim;
+        console.log(`[ds-proxy] [${rid}] 🔄 token updated for existing account ${body.email || "unknown"}`);
+      } else {
+        pool.push({ token: body.token, email: body.email, dliq: body.dliq, leim: body.leim, status: "active", failureCount: 0, lastUsed: 0, recentRequests: [], tokenObtainedAt: Date.now() });
+        console.log(`[ds-proxy] [${rid}] 🔄 new account added to pool: ${body.email || "unknown"} (pool size now ${pool.length})`);
+      }
+      return Response.json({ ok: true, poolSize: pool.length });
+    }
+
+    // ── Admin: trigger re-login for all cooling/dead accounts ─────────────────
+    if (url.pathname === "/admin/relogin-all" && req.method === "POST") {
+      if (!isAdmin(req)) {
+        console.warn(`[ds-proxy] [${rid}] relogin-all — unauthorized`);
+        return Response.json({ error: "Unauthorized" }, { status: 401 });
+      }
+      const targets = pool.filter(a => a.status !== "active" && a.email && a.password);
+      console.log(`[ds-proxy] [${rid}] relogin-all — ${targets.length} account(s) to re-login: ${targets.map(a => a.email).join(", ")}`);
+      targets.forEach(a => reloginAccount(a).catch(() => {}));
+      return Response.json({ ok: true, relogging: targets.length, accounts: targets.map(a => a.email) });
+    }
+
+    // ── Pool status ───────────────────────────────────────────────────────────
+    if (url.pathname === "/admin/pool-status" && req.method === "GET") {
+      if (!isAdmin(req)) return Response.json({ error: "Unauthorized" }, { status: 401 });
+      const medianTtlMs = tokenLifetimeObservations.length > 2
+        ? tokenLifetimeObservations.slice().sort((a, b) => a - b)[Math.floor(tokenLifetimeObservations.length / 2)]
+        : null;
+      return Response.json({
+        throttle: { windowMs: THROTTLE_WINDOW_MS, maxReq: THROTTLE_MAX_REQ },
+        tokenLifetime: {
+          observations: tokenLifetimeObservations.length,
+          medianHours: medianTtlMs ? +(medianTtlMs / 3_600_000).toFixed(1) : null,
+          lastExpiries: tokenLifetimeObservations.slice(-5).map(ms => +(ms / 3_600_000).toFixed(1) + "h"),
+        },
+        accounts: pool.map(a => ({
+          email: a.email || "unknown",
+          status: a.status,
+          failureCount: a.failureCount,
+          hasToken: !!a.token,
+          hasCredentials: !!(a.email && a.password),
+          tokenAgeHours: a.tokenObtainedAt ? +((Date.now() - a.tokenObtainedAt) / 3_600_000).toFixed(1) : null,
+          lastUsed: a.lastUsed ? new Date(a.lastUsed).toISOString() : null,
+          coolingUntil: a.coolingUntil ? new Date(a.coolingUntil).toISOString() : null,
+          reqInWindow: windowCount(a),
+        })),
+      });
+    }
+
+    // ── Models ────────────────────────────────────────────────────────────────
+    if (url.pathname === "/v1/models") {
+      return Response.json({
+        object: "list",
+        data: [
+          { id: "deepseek-chat",     object: "model", created: 1700000000, owned_by: "deepseek" },
+          { id: "deepseek-reasoner", object: "model", created: 1700000000, owned_by: "deepseek" },
+        ],
+      });
+    }
+
+    // ── Chat completions ──────────────────────────────────────────────────────
+    if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
+      const body = await req.json() as any;
+      const isStream = !!body.stream;
+      const msgCount = body.messages?.length ?? 0;
+      const lastMsg = (body.messages?.[msgCount - 1]?.content ?? "").slice(0, 80);
+      console.log(`[ds-proxy] [${rid}] chat/completions model=${body.model} stream=${isStream} messages=${msgCount} lastMsg="${lastMsg}…"`);
+
+      const s = poolSummary();
+      console.log(`[ds-proxy] [${rid}] pool state — active=${s.active} cooling=${s.cooling} dead=${s.dead} total=${s.total}`);
+
+      let upstream: Response | null = null;
+      let usedAcc: PoolAccount | null = null;
+      let sessionId = "";
+      let lastErrText = "";
+      const tried = new Set<PoolAccount>();
+      let attempt = 0;
+
+      while (true) {
+        attempt++;
+        const acc = pickAccount();
+        if (!acc || tried.has(acc)) {
+          console.error(`[ds-proxy] [${rid}] ✗ all accounts exhausted after ${attempt - 1} attempt(s)`);
+          notifyPoolExhausted();
+          return Response.json({
+            error: "All DeepSeek accounts exhausted — token refresh needed",
+            pool: poolSummary(),
+          }, { status: 503 });
+        }
+
+        tried.add(acc);
+        acc.lastUsed = Date.now();
+        recordRequest(acc);
+        console.log(`[ds-proxy] [${rid}] attempt ${attempt} — using account ${acc.email || "??"} (reqInWindow=${windowCount(acc)})`);
+
+        try {
+          const result = await doCompletion(body, acc, rid);
+          if (!result.upstream.ok) {
+            const { expired, text } = await isExpiredToken(result.upstream);
+            lastErrText = text;
+            if (expired) {
+              console.warn(`[ds-proxy] [${rid}] ⚠ 40003 (token expired) on ${acc.email || "??"} — cooling, trying next`);
+              coolAccount(acc);
+              continue;
+            }
+            if (result.upstream.status === 429) {
+              console.warn(`[ds-proxy] [${rid}] ⚠ 429 (rate limit) on ${acc.email || "??"} — soft cooling 2min, trying next`);
+              acc.status = "cooling";
+              acc.coolingUntil = Date.now() + 2 * 60 * 1000;
+              continue;
+            }
+            console.error(`[ds-proxy] [${rid}] ✗ upstream HTTP ${result.upstream.status} on ${acc.email}: ${text.slice(0, 200)}`);
+            return new Response(text, { status: result.upstream.status, headers: { "content-type": "application/json" } });
+          }
+          upstream = result.upstream;
+          usedAcc = acc;
+          sessionId = result.sessionId;
+          break;
+        } catch (err: any) {
+          console.error(`[ds-proxy] [${rid}] ✗ doCompletion threw (${acc.email}): ${err.message}`);
+          coolAccount(acc);
+          continue;
+        }
+      }
+
+      const setupMs = Date.now() - t0;
+      console.log(`[ds-proxy] [${rid}] ✓ upstream ready — account=${usedAcc!.email || "??"} session=${sessionId} setupMs=${setupMs}`);
+
+      // ── Streaming ────────────────────────────────────────────────────────
+      if (isStream) {
+        const stream = new ReadableStream({
+          async start(controller) {
+            const reader = upstream!.body!.getReader();
+            const decoder = new TextDecoder();
+            const te = new TextEncoder();
+            let buffer = "";
+            let fullText = "";
+            let chunkCount = 0;
+            const msgId = `chatcmpl-ds-${Date.now()}`;
+
+            const emit = (chunk: any) => controller.enqueue(te.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split("\n");
+              buffer = lines.pop() || "";
+
+              for (const line of lines) {
+                if (!line.trim() || line.startsWith("event:") || !line.startsWith("data:")) continue;
+                const data = line.slice(5).trim();
+                if (!data) continue;
+                try {
+                  const event = JSON.parse(data);
+                  if (event.v && typeof event.v === "string" && !event.p) {
+                    fullText += event.v;
+                    chunkCount++;
+                    emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: event.v }, finish_reason: null }] });
+                  } else if (event.v?.response?.fragments) {
+                    for (const frag of event.v.response.fragments) {
+                      if (frag.content) {
+                        fullText += frag.content;
+                        chunkCount++;
+                        emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: frag.content }, finish_reason: null }] });
+                      }
+                    }
+                  } else if (event.p === "response/status" && event.v === "FINISHED") {
+                    emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+                    controller.enqueue(te.encode("data: [DONE]\n\n"));
+                  }
+                } catch { /* skip non-JSON */ }
+              }
+            }
+
+            const totalMs = Date.now() - t0;
+            console.log(`[ds-proxy] [${rid}] ✓ stream done — account=${usedAcc!.email || "??"} chars=${fullText.length} chunks=${chunkCount} totalMs=${totalMs}`);
+            controller.close();
+          },
+        });
+
+        return new Response(stream, {
+          headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "connection": "keep-alive" },
+        });
+      }
+
+      // ── Non-streaming ────────────────────────────────────────────────────
+      const text = await upstream!.text();
+      let fullText = "";
+      for (const line of text.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        try {
+          const event = JSON.parse(data);
+          if (event.v && typeof event.v === "string" && !event.p) fullText += event.v;
+          else if (event.v?.response?.fragments) {
+            for (const f of event.v.response.fragments) if (f.content) fullText += f.content;
+          }
+        } catch { /* skip */ }
+      }
+
+      const totalMs = Date.now() - t0;
+      console.log(`[ds-proxy] [${rid}] ✓ non-stream done — account=${usedAcc!.email || "??"} chars=${fullText.length} totalMs=${totalMs}`);
+      return Response.json({
+        id: `chatcmpl-ds-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: body.model,
+        choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      });
+    }
+
+    console.warn(`[ds-proxy] [${rid}] 404 — ${req.method} ${url.pathname}`);
+    return Response.json({ error: "Not found" }, { status: 404 });
+  },
+});
+
+const s = poolSummary();
+console.log(`
+╔══════════════════════════════════════════════════════╗
+║       DeepSeek Web Proxy — Pool Mode                 ║
+╠══════════════════════════════════════════════════════╣
+║  Port:      ${PORT}
+║  Base URL:  http://localhost:${PORT}/v1
+║  Pool:      ${s.active}/${s.total} accounts active (${s.cooling} cooling, ${s.dead} dead)
+║  VPS:       ${process.env.VPS_PROXY_URL || "not set — login calls go direct"}
+║  Admin:     POST /admin/reload-pool   (full pool swap)
+║             POST /admin/reload-tokens (single token)
+║             GET  /admin/pool-status   (pool health)
+║             POST /admin/relogin-all   (refresh cooled)
+╚══════════════════════════════════════════════════════╝
+`);
