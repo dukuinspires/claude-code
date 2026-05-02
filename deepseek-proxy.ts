@@ -466,24 +466,36 @@ async function reloginAccount(acc: PoolAccount) {
     acc.totalEmpty = 0;
     console.log(`[ds-proxy] [relogin] ✓ re-login succeeded for ${acc.email} in ${elapsed}ms`);
 
-    // Persist back to SmartAssist
+    // Persist back to SmartAssist with retries — token loss here means it's gone on restart
     const saUrl = process.env.SMARTASSIST_URL || "";
     const internalTok = process.env.INTERNAL_AUTH_TOKEN || "";
     if (saUrl && internalTok) {
       console.log(`[ds-proxy] [relogin] persisting new token for ${acc.email} → SmartAssist`);
-      getSmartAssistIdToken().then(idToken => {
-        fetch(`${saUrl}/api/admin/deepseek-proxy/reload-tokens`, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-internal-token": internalTok,
-            ...(idToken ? { "Authorization": `Bearer ${idToken}` } : {}),
-          },
-          body: JSON.stringify({ token: newToken, email: acc.email }),
-        })
-          .then(r => console.log(`[ds-proxy] [relogin] SmartAssist token persist HTTP ${r.status} for ${acc.email}`))
-          .catch(e => console.error(`[ds-proxy] [relogin] ✗ SmartAssist persist failed for ${acc.email}: ${e.message}`));
-      });
+      (async () => {
+        const idToken = await getSmartAssistIdToken();
+        const headers: Record<string, string> = {
+          "content-type": "application/json",
+          "x-internal-token": internalTok,
+          ...(idToken ? { "Authorization": `Bearer ${idToken}` } : {}),
+        };
+        const body = JSON.stringify({ token: newToken, email: acc.email });
+        const persistUrl = `${saUrl}/api/admin/deepseek-proxy/reload-tokens`;
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            const r = await fetch(persistUrl, { method: "POST", headers, body });
+            if (r.ok) {
+              console.log(`[ds-proxy] [relogin] ✓ SmartAssist token persist HTTP ${r.status} for ${acc.email} (attempt ${attempt})`);
+              return;
+            }
+            console.warn(`[ds-proxy] [relogin] ⚠ SmartAssist persist HTTP ${r.status} for ${acc.email} (attempt ${attempt}/3)`);
+          } catch (e: any) {
+            console.error(`[ds-proxy] [relogin] ✗ SmartAssist persist attempt ${attempt}/3 failed for ${acc.email}: ${e.message}`);
+          }
+          if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 2000));
+        }
+        console.error(`[ds-proxy] [relogin] ✗✗ CRITICAL: token for ${acc.email} NOT persisted after 3 attempts — will be lost on restart`);
+      })();
     } else {
       console.warn(`[ds-proxy] [relogin] ⚠ SMARTASSIST_URL or INTERNAL_AUTH_TOKEN not set — new token not persisted for ${acc.email}`);
     }
