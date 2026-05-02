@@ -672,6 +672,75 @@ ${toolDefs}`);
   };
 }
 
+// ─── Tool call extraction from text output ───────────────────────────────────
+// DeepSeek web API doesn't support native tool_calls. The model outputs tool
+// invocations as text in various formats. We parse all known patterns and
+// convert to structured tool calls.
+
+interface ParsedToolCall { name: string; input: Record<string, any> }
+
+function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] {
+  const calls: ParsedToolCall[] = [];
+  const tag = rid ? `[ds-proxy] [${rid}] [tool-parse]` : "[tool-parse]";
+
+  // Pattern 1: <tool_call>{"name":"...","input":{...}}</tool_call> (our injected format)
+  const p1 = /<(?:tool_call|_call|ool_call)>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g;
+  let m;
+  while ((m = p1.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(m[1]);
+      if (parsed.name) {
+        calls.push({ name: parsed.name, input: parsed.input || parsed.parameters || {} });
+        console.log(`${tag} P1 match: ${parsed.name}(${JSON.stringify(parsed.input || {}).slice(0, 100)})`);
+      }
+    } catch (e) { console.warn(`${tag} P1 JSON parse failed: ${(e as any).message}`); }
+  }
+
+  // Pattern 2: <tool_calls><invoke name="..."><parameter name="..." ...>value</parameter></invoke></tool_calls>
+  // (Claude XML format that DeepSeek mimics)
+  const p2 = /<invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/invoke>/g;
+  while ((m = p2.exec(text)) !== null) {
+    const toolName = m[1];
+    const paramsBlock = m[2];
+    const params: Record<string, any> = {};
+    const paramRegex = /<parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/parameter>/g;
+    let pm;
+    while ((pm = paramRegex.exec(paramsBlock)) !== null) {
+      let val: any = pm[2].trim();
+      // Try to parse as JSON, fall back to string
+      try { val = JSON.parse(val); } catch { /* keep as string */ }
+      params[pm[1]] = val;
+    }
+    calls.push({ name: toolName, input: params });
+    console.log(`${tag} P2 match (XML): ${toolName}(${JSON.stringify(params).slice(0, 100)})`);
+  }
+
+  // Pattern 3: {"name":"tool_name","parameters":{...}} bare JSON (some DeepSeek outputs)
+  if (calls.length === 0) {
+    const p3 = /\{"name"\s*:\s*"([^"]+)"\s*,\s*"(?:parameters|input|arguments)"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
+    while ((m = p3.exec(text)) !== null) {
+      try {
+        const input = JSON.parse(m[2]);
+        calls.push({ name: m[1], input });
+        console.log(`${tag} P3 match (bare JSON): ${m[1]}(${JSON.stringify(input).slice(0, 100)})`);
+      } catch { /* skip */ }
+    }
+  }
+
+  if (calls.length > 0) {
+    console.log(`${tag} ✓ extracted ${calls.length} tool call(s) from ${text.length} chars of text`);
+  }
+  return calls;
+}
+
+function stripToolCallText(text: string): string {
+  return text
+    .replace(/<(?:tool_call|_call|ool_call)>[\s\S]*?<\/tool_call>/g, "")
+    .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/g, "")
+    .replace(/<invoke\s+name="[^"]*"[\s\S]*?<\/invoke>/g, "")
+    .trim();
+}
+
 // ─── Check for expired-token error code ──────────────────────────────────────
 async function isExpiredToken(res: Response): Promise<{ expired: boolean; text: string }> {
   const text = await res.text();
@@ -1264,72 +1333,92 @@ Bun.serve({
       console.log(`[ds-proxy] [${rid}] ✓ upstream ready — account=${usedAcc!.email || "??"} session=${sessionId} setupMs=${setupMs}`);
 
       // ── Streaming ────────────────────────────────────────────────────────
+      // Buffer the full response, then check for tool calls before emitting.
+      // If tool calls found, emit them as structured tool_calls instead of text.
       if (isStream) {
-        const stream = new ReadableStream({
-          async start(controller) {
-            const reader = upstream!.body!.getReader();
-            const decoder = new TextDecoder();
-            const te = new TextEncoder();
-            let buffer = "";
-            let fullText = "";
-            let chunkCount = 0;
-            const msgId = `chatcmpl-ds-${Date.now()}`;
+        const reader = upstream!.body!.getReader();
+        const decoder = new TextDecoder();
+        let sseBuffer = "";
+        let fullText = "";
+        let chunkCount = 0;
 
+        // Collect full response
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          sseBuffer += decoder.decode(value, { stream: true });
+          const lines = sseBuffer.split("\n");
+          sseBuffer = lines.pop() || "";
+          for (const line of lines) {
+            if (!line.trim() || line.startsWith("event:") || !line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (!data) continue;
+            try {
+              const event = JSON.parse(data);
+              if (event.v && typeof event.v === "string" && !event.p) {
+                fullText += event.v;
+                chunkCount++;
+              } else if (event.v?.response?.fragments) {
+                for (const frag of event.v.response.fragments) {
+                  if (frag.content) { fullText += frag.content; chunkCount++; }
+                }
+              }
+            } catch { /* skip */ }
+          }
+        }
+
+        const totalMs = Date.now() - t0;
+        // Track empty responses
+        if (fullText.length === 0) {
+          usedAcc!.consecutiveEmpties++;
+          usedAcc!.totalEmpty++;
+          if (usedAcc!.consecutiveEmpties >= 3) {
+            console.warn(`[ds-proxy] [${rid}] ⚠ ${usedAcc!.consecutiveEmpties} consecutive empty streams — proactive cooling ${usedAcc!.email || "??"}`);
+            coolAccount(usedAcc!);
+          }
+        } else {
+          usedAcc!.consecutiveEmpties = 0;
+          usedAcc!.totalWithContent++;
+          if (usedAcc!.totalWithContent % 5 === 0 && usedAcc!.failureCount > 0) {
+            usedAcc!.failureCount = Math.max(0, usedAcc!.failureCount - 1);
+          }
+        }
+
+        // Check for tool calls in the collected text
+        const streamToolCalls = extractToolCallsFromText(fullText, rid);
+        const msgId = `chatcmpl-ds-${Date.now()}`;
+        const te = new TextEncoder();
+
+        const stream = new ReadableStream({
+          start(controller) {
             const emit = (chunk: any) => controller.enqueue(te.encode(`data: ${JSON.stringify(chunk)}\n\n`));
 
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              buffer += decoder.decode(value, { stream: true });
-              const lines = buffer.split("\n");
-              buffer = lines.pop() || "";
+            if (streamToolCalls.length > 0) {
+              // Emit clean text (if any) then tool calls
+              const cleanContent = stripToolCallText(fullText).trim();
+              console.log(`[ds-proxy] [${rid}] 🔧 stream: ${streamToolCalls.length} tool call(s) extracted, clean text=${cleanContent.length} chars`);
 
-              for (const line of lines) {
-                if (!line.trim() || line.startsWith("event:") || !line.startsWith("data:")) continue;
-                const data = line.slice(5).trim();
-                if (!data) continue;
-                try {
-                  const event = JSON.parse(data);
-                  if (event.v && typeof event.v === "string" && !event.p) {
-                    fullText += event.v;
-                    chunkCount++;
-                    emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: event.v }, finish_reason: null }] });
-                  } else if (event.v?.response?.fragments) {
-                    for (const frag of event.v.response.fragments) {
-                      if (frag.content) {
-                        fullText += frag.content;
-                        chunkCount++;
-                        emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: frag.content }, finish_reason: null }] });
-                      }
-                    }
-                  } else if (event.p === "response/status" && event.v === "FINISHED") {
-                    emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-                    controller.enqueue(te.encode("data: [DONE]\n\n"));
-                  }
-                } catch { /* skip non-JSON */ }
+              if (cleanContent) {
+                emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: cleanContent }, finish_reason: null }] });
               }
-            }
-
-            const totalMs = Date.now() - t0;
-            // Track empty responses — soft throttle detection
-            if (fullText.length === 0) {
-              usedAcc!.consecutiveEmpties++;
-              usedAcc!.totalEmpty++;
-              if (usedAcc!.consecutiveEmpties >= 3) {
-                console.warn(`[ds-proxy] [${rid}] ⚠ ${usedAcc!.consecutiveEmpties} consecutive empty streams — proactive cooling ${usedAcc!.email || "??"}`);
-                coolAccount(usedAcc!);
+              // Emit tool calls
+              for (let i = 0; i < streamToolCalls.length; i++) {
+                const tc = streamToolCalls[i];
+                const callId = `call_${Date.now()}_${i}`;
+                emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: callId, type: "function", function: { name: tc.name, arguments: JSON.stringify(tc.input) } }] }, finish_reason: null }] });
               }
+              emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
             } else {
-              usedAcc!.consecutiveEmpties = 0;
-              usedAcc!.totalWithContent++;
-              if (usedAcc!.totalWithContent % 5 === 0 && usedAcc!.failureCount > 0) {
-                usedAcc!.failureCount = Math.max(0, usedAcc!.failureCount - 1);
-              }
+              // No tool calls — emit text as normal stream
+              emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: fullText }, finish_reason: null }] });
+              emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
             }
-            console.log(`[ds-proxy] [${rid}] ✓ stream done — account=${usedAcc!.email || "??"} chars=${fullText.length} chunks=${chunkCount} totalMs=${totalMs}`);
+            controller.enqueue(te.encode("data: [DONE]\n\n"));
             controller.close();
           },
         });
+
+        console.log(`[ds-proxy] [${rid}] ✓ stream done — account=${usedAcc!.email || "??"} chars=${fullText.length} chunks=${chunkCount} toolCalls=${streamToolCalls.length} totalMs=${totalMs}`);
 
         return new Response(stream, {
           headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "connection": "keep-alive" },
@@ -1370,6 +1459,30 @@ Bun.serve({
         }
       }
       console.log(`[ds-proxy] [${rid}] ✓ non-stream done — account=${usedAcc!.email || "??"} chars=${fullText.length} totalMs=${totalMs}`);
+
+      // ── Parse tool calls from text output for OpenAI format ──
+      const parsedOAIToolCalls = extractToolCallsFromText(fullText, rid);
+      if (parsedOAIToolCalls.length > 0) {
+        const cleanContent = stripToolCallText(fullText).trim() || null;
+        console.log(`[ds-proxy] [${rid}] 🔧 extracted ${parsedOAIToolCalls.length} tool call(s) from text — content=${cleanContent?.length ?? 0} chars`);
+        return Response.json({
+          id: `chatcmpl-ds-${Date.now()}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: body.model,
+          choices: [{ index: 0, message: {
+            role: "assistant",
+            content: cleanContent,
+            tool_calls: parsedOAIToolCalls.map((tc, i) => ({
+              id: `call_${Date.now()}_${i}`,
+              type: "function",
+              function: { name: tc.name, arguments: JSON.stringify(tc.input) },
+            })),
+          }, finish_reason: "tool_calls" }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        });
+      }
+
       return Response.json({
         id: `chatcmpl-ds-${Date.now()}`,
         object: "chat.completion",
