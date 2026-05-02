@@ -715,7 +715,18 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
     console.log(`${tag} P2 match (XML): ${toolName}(${JSON.stringify(params).slice(0, 100)})`);
   }
 
-  // Pattern 3: {"name":"tool_name","parameters":{...}} bare JSON (some DeepSeek outputs)
+  // Pattern 3: <tool_call name="entity"> {"action":"...","entity":"..."} </tool_call>
+  // (Hybrid format — tool name as XML attribute, params as JSON body)
+  const p3h = /<(?:tool_call|_call)\s+name="([^"]+)"[^>]*>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g;
+  while ((m = p3h.exec(text)) !== null) {
+    try {
+      const input = JSON.parse(m[2]);
+      calls.push({ name: m[1], input });
+      console.log(`${tag} P3h match (hybrid XML+JSON): ${m[1]}(${JSON.stringify(input).slice(0, 100)})`);
+    } catch (e) { console.warn(`${tag} P3h JSON parse failed: ${(e as any).message}`); }
+  }
+
+  // Pattern 4: {"name":"tool_name","parameters":{...}} bare JSON (some DeepSeek outputs)
   if (calls.length === 0) {
     const p3 = /\{"name"\s*:\s*"([^"]+)"\s*,\s*"(?:parameters|input|arguments)"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
     while ((m = p3.exec(text)) !== null) {
@@ -735,7 +746,7 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
 
 function stripToolCallText(text: string): string {
   return text
-    .replace(/<(?:tool_call|_call|ool_call)>[\s\S]*?<\/tool_call>/g, "")
+    .replace(/<(?:tool_call|_call|ool_call)[^>]*>[\s\S]*?<\/tool_call>/g, "")
     .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/g, "")
     .replace(/<invoke\s+name="[^"]*"[\s\S]*?<\/invoke>/g, "")
     .trim();
