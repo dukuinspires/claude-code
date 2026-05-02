@@ -1393,7 +1393,8 @@ Bun.serve({
             if (!data) continue;
             try {
               const event = JSON.parse(data);
-              if (event.v && typeof event.v === "string" && !event.p) {
+              if (event.v && typeof event.v === "string") {
+                // Capture both bare text chunks AND APPEND events (which have event.p set)
                 fullText += event.v;
                 chunkCount++;
               } else if (event.v?.response?.fragments) {
@@ -1474,7 +1475,7 @@ Bun.serve({
         const data = line.slice(5).trim();
         try {
           const event = JSON.parse(data);
-          if (event.v && typeof event.v === "string" && !event.p) fullText += event.v;
+          if (event.v && typeof event.v === "string") fullText += event.v;
           else if (event.v?.response?.fragments) {
             for (const f of event.v.response.fragments) if (f.content) fullText += f.content;
           }
