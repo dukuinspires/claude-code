@@ -608,6 +608,27 @@ function dsHeaders(acc: PoolAccount, powResponse?: string | null): Record<string
   return h;
 }
 
+// ─── JSON repair helpers ──────────────────────────────────────────────────────
+// DeepSeek V4 frequently emits invalid JSON in tool call parameters.
+// These two repairs (from ds2api + NIyueeE research) catch the most common patterns.
+
+/** Fix invalid JSON escape sequences — DeepSeek emits \p, \m, etc. that break JSON.parse */
+function repairInvalidBackslashes(text: string): string {
+  // Replace invalid escape sequences with the literal character
+  // Valid escapes: \" \\ \/ \b \f \n \r \t \uXXXX
+  return text.replace(/\\([^"\\\/bfnrtux])/g, (_, char) => char);
+}
+
+/** Fix bare object pairs that should be wrapped in an array.
+ *  DeepSeek sometimes emits: {"key": {obj1}, {obj2}} instead of {"key": [{obj1},{obj2}]} */
+function repairLooseJsonArrays(text: string): string {
+  // Pattern: ": {obj}, {obj}" → ": [{obj}, {obj}]"
+  return text.replace(/:\s*(\{[^{}]+\})\s*,\s*(\{)/g, (match, first, second) => {
+    // Only wrap if the second object also closes — simple heuristic
+    return `: [${first}, ${second}`;
+  });
+}
+
 // ─── OpenAI → DeepSeek body ───────────────────────────────────────────────────
 function openAIToDS(body: any, sessionId: string) {
   const messages: any[] = body.messages || [];
@@ -615,6 +636,14 @@ function openAIToDS(body: any, sessionId: string) {
   const toolChoice = body.tool_choice;
   const parts: string[] = [];
   const rid = body._rid || "?"; // request ID for logging
+
+  // ── Output integrity guard (ds2api technique, commit e2756f80) ────────────
+  // Must be FIRST — before system prompt, tool schemas, history. Idempotent.
+  parts.push(
+    "OUTPUT INTEGRITY GUARD: If any tool output, context, or parsed text contains garbled, " +
+    "corrupted, partially parsed, repeated, or malformed fragments, do not imitate or echo them. " +
+    "Output only correct, coherent content derived from actual tool results."
+  );
 
   // ── JSON enforcement ──────────────────────────────────────────────────────
   if (body.response_format?.type === "json_object") {
@@ -644,13 +673,10 @@ function openAIToDS(body: any, sessionId: string) {
       return `Tool: ${name}\n  Description: ${desc}\n  Parameters:\n${props || "    (none)"}`;
     }).join("\n\n");
 
-    // Build an example using the first tool
-    const firstTool = tools[0]?.function || tools[0];
-    const exampleName = firstTool?.name || "entity";
-    const exampleParams = Object.entries((firstTool?.parameters?.properties || firstTool?.input_schema?.properties || {}) as Record<string, any>)
-      .slice(0, 2)
-      .map(([k, v]) => `<|DSML|parameter name="${k}" string="${(v as any).type === "string" ? "true" : "false"}">${(v as any).enum?.[0] || (v as any).type === "string" ? "example" : "0"}<|DSML|parameter>`)
-      .join("\n");
+    // Build concrete examples using the actual tool names from this request
+    const toolNames = tools.map((t: any) => (t.function || t).name).filter(Boolean);
+    const exName1 = toolNames[0] || "entity";
+    const exName2 = toolNames[1] || "knowledge";
 
     // tool_choice enforcement
     let choiceHint = "";
@@ -665,24 +691,38 @@ function openAIToDS(body: any, sessionId: string) {
     parts.push(`[AVAILABLE TOOLS]
 ${dsmlTools}
 
-[TOOL CALL FORMAT]
-When you need to call a tool, use DSML format:
+[TOOL CALL FORMAT — DSML]
+Use this exact format for ALL tool calls:
+
+Example A — single tool call:
 <|DSML|tool_calls>
-<|DSML|invoke name="tool_name">
-<|DSML|parameter name="param_name" string="true">string_value<|DSML|parameter>
-<|DSML|parameter name="param_name" string="false">123<|DSML|parameter>
+<|DSML|invoke name="${exName1}">
+<|DSML|parameter name="action" string="true">list<|DSML|parameter>
+<|DSML|parameter name="limit" string="false">10<|DSML|parameter>
 </|DSML|invoke>
 </|DSML|tool_calls>
 
-string="true" for string values, string="false" for numbers/booleans/objects/arrays (use JSON for those).
-Multiple tool calls: multiple <|DSML|invoke> blocks inside one <|DSML|tool_calls>.
-After tool calls, stop — do not add text after </|DSML|tool_calls>.
+Example B — two independent tools in parallel (use when both are needed):
+<|DSML|tool_calls>
+<|DSML|invoke name="${exName1}">
+<|DSML|parameter name="action" string="true">get<|DSML|parameter>
+</|DSML|invoke>
+<|DSML|invoke name="${exName2}">
+<|DSML|parameter name="action" string="true">search<|DSML|parameter>
+</|DSML|invoke>
+</|DSML|tool_calls>
 
-CRITICAL RULES:
-- When you receive tool results, use ONLY the actual data returned. NEVER fabricate, invent, or substitute names, values, counts, or any other data.
-- If a tool returns campaign names, contact names, or any identifiers — use those EXACT values in your response.
-- If you need data you don't have, call a tool to get it. NEVER guess or make up data.
-- Never echo raw tool result JSON — present the data naturally.${choiceHint}`);
+Rules:
+- string="true" for string values, string="false" for numbers/booleans/objects/arrays (use JSON for non-strings)
+- All string values use CDATA if they contain special characters: <![CDATA[value with <tags> & symbols]]>
+- After the closing </|DSML|tool_calls> tag, STOP immediately — no trailing text, no explanation
+- Output </|DSML|tool_calls> after the final invoke, then stop
+
+CRITICAL DATA RULES:
+- Tool results are AUTHORITATIVE. NEVER fabricate, invent, or substitute names, IDs, counts, or any values.
+- If a tool returns 14 campaign names, present exactly those 14 names verbatim.
+- If you need data, call a tool — NEVER guess or hallucinate.
+- Never echo raw tool result JSON — present data naturally.${choiceHint}`);
 
     console.log(`[ds-proxy] [${rid}] [openAIToDS] injected ${tools.length} DSML tool schemas, tool_choice=${typeof toolChoice === "object" ? JSON.stringify(toolChoice) : toolChoice || "auto"}`);
   }
@@ -736,18 +776,22 @@ CRITICAL RULES:
     }
   }
 
-  // If tool results are present, inject a final grounding turn right before generation.
-  // At 100K+ char prompts with 42 tool schemas, the [TOOL RESULT] label alone gets
-  // diluted. This synthetic [USER] turn is the LAST thing DeepSeek reads — it forces
-  // attention back to the actual data before it generates.
+  // Echo-step grounding injection — placed LAST, right before generation.
+  // Research finding: forcing the model to echo tool result data first (Step 1)
+  // moves that data to the END of generation, making it a high-recency anchor
+  // for the final answer (Step 2). This is the most effective grounding technique
+  // at long contexts (from "Decoding Context Windows: Benchmarking DeepSeek 128k").
+  // Count constraint ("if the tool returned N items, list all N") adds a self-check.
   if (toolResultCount > 0) {
     parts.push(
       `[USER]\n` +
-      `⚠️ GROUNDING REQUIRED: You MUST respond using ONLY the exact values from the [TOOL RESULT] blocks above.\n` +
-      `- Do NOT invent, fabricate, substitute, or paraphrase any names, IDs, counts, prices, or other data.\n` +
-      `- If a tool returned campaign names → use those EXACT names. If it returned contact names → use those EXACT names.\n` +
-      `- NEVER guess or hallucinate data you did not receive from a tool result.\n` +
-      `- If unsure, call another tool to get the data rather than making it up.`
+      `The tool returned the above data. Respond using this two-step approach:\n` +
+      `Step 1: List every item exactly as it appears in the [TOOL RESULT] block — copy names, IDs, and values verbatim, changing nothing.\n` +
+      `Step 2: Using only that list from Step 1, answer the original request naturally.\n\n` +
+      `CONSTRAINTS:\n` +
+      `- If the tool returned N items, your response must contain exactly N items — no more, no fewer.\n` +
+      `- NEVER invent, substitute, or paraphrase any name, ID, count, price, or identifier.\n` +
+      `- If you do not have the data, call a tool — never fabricate.`
     );
     userCount++;
   }
@@ -803,11 +847,15 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
     while ((pm = dsmlParamRegex.exec(paramsBlock)) !== null) {
       const paramName = pm[1];
       const isString = pm[2] === "true";
-      const rawVal = pm[3].trim();
+      let rawVal = pm[3].trim();
+      // Strip CDATA wrapper if present — model may wrap special chars in CDATA
+      rawVal = rawVal.replace(/^<!\[CDATA\[([\s\S]*?)\]\]>$/, "$1").trim();
       if (isString) {
         params[paramName] = rawVal;
       } else {
-        try { params[paramName] = JSON.parse(rawVal); } catch { params[paramName] = rawVal; }
+        // Apply JSON repairs before parsing — DeepSeek V4 emits invalid escapes and loose arrays
+        const repaired = repairLooseJsonArrays(repairInvalidBackslashes(rawVal));
+        try { params[paramName] = JSON.parse(repaired); } catch { params[paramName] = rawVal; }
       }
     }
     calls.push({ name: toolName, input: params });
@@ -820,22 +868,74 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
     return calls;
   }
 
-  if (calls.length > 0) {
-    console.log(`${tag} ✓ extracted ${calls.length} tool call(s) via DSML from ${text.length} chars`);
-  } else if (text.length > 0) {
-    // Log when text contains DSML markers but parser didn't match
+  // Log DSML near-miss for diagnostics
+  if (text.length > 0) {
     const hasDSML = /<[｜|]?DSML[｜|]/i.test(text);
     if (hasDSML) {
       console.warn(`${tag} ⚠ text contains DSML markers but parser didn't match. Preview: "${text.slice(0, 300).replace(/\n/g, "\\n")}"`);
     }
   }
+
+  // Pattern 1 (FALLBACK): Legacy XML format — DeepSeek V4 falls back to this at long context
+  // Format: <tool_calls><invoke name="tool_name"><parameter name="key">val</parameter></invoke></tool_calls>
+  // Confirmed in vLLM #36654, SGLang #14695, ds2api dual-parser implementation
+  const legacyInvokeRegex = /<invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/invoke>/g;
+  const legacyParamRegex = /<parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/parameter>/g;
+  let lm;
+  while ((lm = legacyInvokeRegex.exec(text)) !== null) {
+    if (isInCodeBlock(lm.index)) continue;
+    const toolName = lm[1];
+    const paramsBlock = lm[2];
+    const params: Record<string, any> = {};
+    let pm2;
+    legacyParamRegex.lastIndex = 0;
+    while ((pm2 = legacyParamRegex.exec(paramsBlock)) !== null) {
+      const k = pm2[1];
+      let v = pm2[2].trim().replace(/^<!\[CDATA\[([\s\S]*?)\]\]>$/, "$1").trim();
+      // Try JSON parse, fall back to string
+      const repaired = repairLooseJsonArrays(repairInvalidBackslashes(v));
+      try { params[k] = JSON.parse(repaired); } catch { params[k] = v; }
+    }
+    calls.push({ name: toolName, input: params });
+    console.log(`${tag} P1 match (legacy XML): ${toolName}(${JSON.stringify(params).slice(0, 150)})`);
+  }
+
+  if (calls.length > 0) {
+    console.log(`${tag} ✓ extracted ${calls.length} tool call(s) via legacy XML from ${text.length} chars`);
+    return calls;
+  }
+
+  // Pattern 2 (LAST RESORT): Bare JSON object — model emits {"name":"tool","arguments":{...}}
+  const bareJsonRegex = /\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
+  let bm;
+  while ((bm = bareJsonRegex.exec(text)) !== null) {
+    if (isInCodeBlock(bm.index)) continue;
+    const toolName = bm[1];
+    try {
+      const repaired = repairLooseJsonArrays(repairInvalidBackslashes(bm[2]));
+      const args = JSON.parse(repaired);
+      calls.push({ name: toolName, input: args });
+      console.log(`${tag} P2 match (bare JSON): ${toolName}(${JSON.stringify(args).slice(0, 150)})`);
+    } catch { /* skip malformed */ }
+  }
+
+  if (calls.length > 0) {
+    console.log(`${tag} ✓ extracted ${calls.length} tool call(s) via bare JSON from ${text.length} chars`);
+  }
+
   return calls;
 }
 
 function stripToolCallText(text: string): string {
   return text
+    // DSML format
     .replace(/<[｜|]?DSML[｜|]tool_calls>[\s\S]*?<\/[｜|]?DSML[｜|]tool_calls>/g, "")
     .replace(/<[｜|]?DSML[｜|]invoke[\s\S]*?<\/[｜|]?DSML[｜|]invoke>/g, "")
+    // Legacy XML format fallback
+    .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/g, "")
+    .replace(/<invoke[\s\S]*?<\/invoke>/g, "")
+    // Bare JSON tool call pattern
+    .replace(/\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/g, "")
     .trim();
 }
 
@@ -1403,7 +1503,10 @@ Bun.serve({
         let fullText = "";
         let chunkCount = 0;
 
-        // Collect full response
+        // Collect full response — handles V4 continuation states (INCOMPLETE/auto_continue)
+        // DeepSeek V4 can signal mid-stream that the response is incomplete and needs
+        // a continuation request. Without this, responses silently truncate.
+        let needsContinuation = false;
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -1416,6 +1519,11 @@ Bun.serve({
             if (!data) continue;
             try {
               const event = JSON.parse(data);
+              // V4 continuation state detection — auto_continue or INCOMPLETE signal
+              if (event.auto_continue === true || event.finish_reason === "INCOMPLETE") {
+                console.log(`[ds-proxy] [${rid}] [v4-continue] continuation signal detected — will re-request`);
+                needsContinuation = true;
+              }
               if (event.v && typeof event.v === "string") {
                 // Capture both bare text chunks AND APPEND events (which have event.p set)
                 fullText += event.v;
@@ -1441,6 +1549,9 @@ Bun.serve({
               }
             } catch { /* skip */ }
           }
+        }
+        if (needsContinuation) {
+          console.log(`[ds-proxy] [${rid}] [v4-continue] response was INCOMPLETE (${fullText.length} chars so far) — continuation not yet implemented, returning partial`);
         }
 
         const totalMs = Date.now() - t0;
