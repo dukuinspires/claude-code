@@ -117,7 +117,6 @@ function recordTokenExpiry(acc: PoolAccount) {
 }
 
 let pool: PoolAccount[] = [];
-let poolIndex = 0;
 
 function poolSummary() {
   return {
@@ -613,6 +612,8 @@ function dsHeaders(acc: PoolAccount, powResponse?: string | null): Record<string
 // upload to DeepSeek's file API. Removes the lost-in-the-middle problem by
 // converting old context from inline tokens into a document the model reads.
 const CONTEXT_OFFLOAD_CHARS = 60_000;
+/** Formatting overhead added by openAIToDS (output integrity guard, DSML block, echo-step, labels) */
+const PROMPT_OVERHEAD_CHARS = 8_000;
 
 // ─── History transcript builder ───────────────────────────────────────────────
 // Mirrors ds2api's BuildOpenAICurrentInputContextTranscript format exactly.
@@ -642,8 +643,10 @@ function buildHistoryTranscript(messages: any[]): string {
     if (hasToolCalls) {
       for (const tc of msg.tool_calls) {
         const name = tc.function?.name || tc.name || "unknown";
-        const args = tc.function?.arguments || "{}";
-        lines.push(`[tool_call: ${name}(${args})]`);
+        const argsStr = typeof tc.function?.arguments === "string"
+          ? tc.function.arguments
+          : JSON.stringify(tc.function?.arguments ?? (tc as any).input ?? {});
+        lines.push(`[tool_call: ${name}(${argsStr})]`);
       }
     }
     if (text) lines.push(text);
@@ -776,21 +779,25 @@ async function autoContinue(
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
     let buf = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split("\n");
-      buf = lines.pop() || "";
-      for (const line of lines) {
-        if (!line.startsWith("data:")) continue;
-        const data = line.slice(5).trim();
-        try {
-          const event = JSON.parse(data);
-          if (event.v && typeof event.v === "string") continuedText += event.v;
-          else if (event.v?.content && typeof event.v.content === "string") continuedText += event.v.content;
-        } catch { /* skip */ }
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          try {
+            const event = JSON.parse(data);
+            if (event.v && typeof event.v === "string") continuedText += event.v;
+            else if (event.v?.content && typeof event.v.content === "string") continuedText += event.v.content;
+          } catch { /* skip */ }
+        }
       }
+    } finally {
+      reader.cancel();
     }
     console.log(`[ds-proxy] [${rid}] [v4-continue] ✓ got ${continuedText.length} continuation chars`);
     return continuedText;
@@ -999,7 +1006,11 @@ CRITICAL DATA RULES:
   // for the final answer (Step 2). This is the most effective grounding technique
   // at long contexts (from "Decoding Context Windows: Benchmarking DeepSeek 128k").
   // Count constraint ("if the tool returned N items, list all N") adds a self-check.
-  if (toolResultCount > 0) {
+  // Only inject echo-step grounding when at least one tool result is substantial (>500 chars).
+  // Short results like {"count":14} or {"ok":true} don't need it — the instruction overhead
+  // outweighs the benefit and can confuse the model ("list every item" when there's nothing to list).
+  const hasSubstantialResult = parts.some(p => p.startsWith("[TOOL RESULT") && p.length > 500);
+  if (toolResultCount > 0 && hasSubstantialResult) {
     parts.push(
       `[USER]\n` +
       `The tool returned the above data. Respond using this two-step approach:\n` +
@@ -1123,13 +1134,31 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
   }
 
   // Pattern 2 (LAST RESORT): Bare JSON object — model emits {"name":"tool","arguments":{...}}
-  const bareJsonRegex = /\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
+  // The regex anchors on the opening brace of the arguments object, then a balanced-brace walk
+  // finds the real closing brace — fixing the non-greedy `}` problem with nested arguments.
+  const bareJsonRegex = /\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{)/g;
   let bm;
   while ((bm = bareJsonRegex.exec(text)) !== null) {
     if (isInCodeBlock(bm.index)) continue;
     const toolName = bm[1];
+    // Walk forward from the opening '{' of arguments to find the balanced closing '}'
+    const argsStart = bm.index + bm[0].length - 1; // position of the '{' captured in group 2
+    let depth = 0;
+    let argsEnd = -1;
+    let inStr = false;
+    let escNext = false;
+    for (let i = argsStart; i < text.length; i++) {
+      const ch = text[i];
+      if (escNext) { escNext = false; continue; }
+      if (ch === "\\" && inStr) { escNext = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === "{") depth++;
+      else if (ch === "}") { depth--; if (depth === 0) { argsEnd = i; break; } }
+    }
+    const argsStr = argsEnd > -1 ? text.slice(argsStart, argsEnd + 1) : bm[2];
     try {
-      const repaired = repairLooseJsonArrays(repairInvalidBackslashes(bm[2]));
+      const repaired = repairLooseJsonArrays(repairInvalidBackslashes(argsStr));
       const args = JSON.parse(repaired);
       calls.push({ name: toolName, input: args });
       console.log(`${tag} P2 match (bare JSON): ${toolName}(${JSON.stringify(args).slice(0, 150)})`);
@@ -1203,7 +1232,7 @@ async function doCompletion(body: any, acc: PoolAccount, rid: string) {
       return sum + text;
     }, 0);
     const toolChars = tools.reduce((sum, t) => sum + JSON.stringify(t).length, 0);
-    const estimatedSize = msgChars + toolChars;
+    const estimatedSize = msgChars + toolChars + PROMPT_OVERHEAD_CHARS;
 
     if (estimatedSize > CONTEXT_OFFLOAD_CHARS) {
       console.log(`[ds-proxy] [${rid}] [context-offload] estimated ${estimatedSize} chars > ${CONTEXT_OFFLOAD_CHARS} threshold — uploading history`);
@@ -1583,22 +1612,26 @@ Bun.serve({
       const reader = oaiResponse.body!.getReader();
       const decoder = new TextDecoder();
       let sseBuffer = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        sseBuffer += decoder.decode(value, { stream: true });
-        const lines = sseBuffer.split("\n");
-        sseBuffer = lines.pop() || "";
-        for (const line of lines) {
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (data === "[DONE]") continue;
-          try {
-            const chunk = JSON.parse(data);
-            const content = chunk.choices?.[0]?.delta?.content;
-            if (content) fullText += content;
-          } catch { /* skip */ }
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          sseBuffer += decoder.decode(value, { stream: true });
+          const lines = sseBuffer.split("\n");
+          sseBuffer = lines.pop() || "";
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (data === "[DONE]") continue;
+            try {
+              const chunk = JSON.parse(data);
+              const content = chunk.choices?.[0]?.delta?.content;
+              if (content) fullText += content;
+            } catch { /* skip */ }
+          }
         }
+      } finally {
+        reader.cancel();
       }
 
       // Parse DSML tool calls from collected text
@@ -1759,65 +1792,72 @@ Bun.serve({
         // a continuation request. Without this, responses silently truncate.
         let needsContinuation = false;
         let responseMessageId: number | null = null;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          sseBuffer += decoder.decode(value, { stream: true });
-          const lines = sseBuffer.split("\n");
-          sseBuffer = lines.pop() || "";
-          for (const line of lines) {
-            if (!line.trim() || line.startsWith("event:") || !line.startsWith("data:")) continue;
-            const data = line.slice(5).trim();
-            if (!data) continue;
-            try {
-              const event = JSON.parse(data);
-              // V4 continuation state detection — auto_continue or INCOMPLETE signal
-              if (event.auto_continue === true || event.finish_reason === "INCOMPLETE") {
-                console.log(`[ds-proxy] [${rid}] [v4-continue] continuation signal detected — will re-request`);
-                needsContinuation = true;
-              }
-              // Capture response message ID — needed for /api/v0/chat/continue call
-              if (typeof event.message_id === "number") responseMessageId = event.message_id;
-              else if (typeof event.id === "number") responseMessageId = event.id;
-              if (event.v && typeof event.v === "string") {
-                // Capture both bare text chunks AND APPEND events (which have event.p set)
-                fullText += event.v;
-                chunkCount++;
-              } else if (typeof event.v === "object" && event.v !== null) {
-                // Check for fragment arrays (JSON Patch replace on response/fragments)
-                if (Array.isArray(event.v)) {
-                  for (const frag of event.v) {
-                    if (frag?.content) { fullText += frag.content; chunkCount++; }
-                  }
-                } else if (event.v?.response?.fragments) {
-                  for (const frag of event.v.response.fragments) {
-                    if (frag.content) { fullText += frag.content; chunkCount++; }
-                  }
-                } else if (event.v?.content && typeof event.v.content === "string") {
-                  // Fragment object with content field directly
-                  fullText += event.v.content;
-                  chunkCount++;
-                } else if (chunkCount < 5) {
-                  // Log first few unhandled object events for diagnostics
-                  console.log(`[ds-proxy] [${rid}] [sse-diag] unhandled object event: ${JSON.stringify(event).slice(0, 300)}`);
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            sseBuffer += decoder.decode(value, { stream: true });
+            const lines = sseBuffer.split("\n");
+            sseBuffer = lines.pop() || "";
+            for (const line of lines) {
+              if (!line.trim() || line.startsWith("event:") || !line.startsWith("data:")) continue;
+              const data = line.slice(5).trim();
+              if (!data) continue;
+              try {
+                const event = JSON.parse(data);
+                // V4 continuation state detection — auto_continue or INCOMPLETE signal
+                if (event.auto_continue === true || event.finish_reason === "INCOMPLETE") {
+                  console.log(`[ds-proxy] [${rid}] [v4-continue] continuation signal detected — will re-request`);
+                  needsContinuation = true;
                 }
-              }
-            } catch { /* skip */ }
+                // Capture response message ID — needed for /api/v0/chat/continue call
+                // DeepSeek may place the message ID in different fields depending on event type
+                const mid = event.message_id ?? event.id ?? event.data?.message_id ?? event.response?.message_id;
+                if (typeof mid === "number") responseMessageId = mid;
+                else if (typeof mid === "string" && /^\d+$/.test(mid)) responseMessageId = parseInt(mid, 10);
+                if (event.v && typeof event.v === "string") {
+                  // Capture both bare text chunks AND APPEND events (which have event.p set)
+                  fullText += event.v;
+                  chunkCount++;
+                } else if (typeof event.v === "object" && event.v !== null) {
+                  // Check for fragment arrays (JSON Patch replace on response/fragments)
+                  if (Array.isArray(event.v)) {
+                    for (const frag of event.v) {
+                      if (frag?.content) { fullText += frag.content; chunkCount++; }
+                    }
+                  } else if (event.v?.response?.fragments) {
+                    for (const frag of event.v.response.fragments) {
+                      if (frag.content) { fullText += frag.content; chunkCount++; }
+                    }
+                  } else if (event.v?.content && typeof event.v.content === "string") {
+                    // Fragment object with content field directly
+                    fullText += event.v.content;
+                    chunkCount++;
+                  } else if (chunkCount < 5) {
+                    // Log first few unhandled object events for diagnostics
+                    console.log(`[ds-proxy] [${rid}] [sse-diag] unhandled object event: ${JSON.stringify(event).slice(0, 300)}`);
+                  }
+                }
+              } catch { /* skip */ }
+            }
           }
+        } finally {
+          reader.cancel();
         }
         // V4 auto-continue loop — up to 8 rounds (mirrors ds2api defaultAutoContinueLimit)
         // When DeepSeek V4 signals INCOMPLETE, call /api/v0/chat/continue to resume.
+        // PoW tokens are single-use — each round MUST get its own fresh token.
+        // TODO: parse each continuation SSE for another INCOMPLETE signal to chain true multi-round.
         if (needsContinuation) {
           if (responseMessageId !== null) {
             console.log(`[ds-proxy] [${rid}] [v4-continue] response INCOMPLETE (${fullText.length} chars) — starting continuation loop (msgId=${responseMessageId})`);
-            // Re-use the original PoW or get a fresh one for the continue endpoint
-            const continuePoW = await getPowResponse("/api/v0/chat/continue", usedAcc!.token);
             for (let round = 1; round <= 8; round++) {
-              const continuation = await autoContinue(usedAcc!, sessionId, responseMessageId, continuePoW, rid);
+              const roundPoW = await getPowResponse("/api/v0/chat/continue", usedAcc!.token);
+              const continuation = await autoContinue(usedAcc!, sessionId, responseMessageId, roundPoW, rid);
               if (continuation.length > 0) {
                 fullText += continuation;
                 console.log(`[ds-proxy] [${rid}] [v4-continue] round ${round} — appended ${continuation.length} chars (total=${fullText.length})`);
-                // autoContinue streams its own response; if it returns text, assume complete.
+                // autoContinue streams its own response; if it returns text, assume complete for now.
                 // Future: parse continuation SSE for another INCOMPLETE signal to chain further rounds.
                 break;
               } else {
