@@ -618,8 +618,10 @@ function openAIToDS(body: any, sessionId: string) {
     parts.push("IMPORTANT: Respond with ONLY a raw JSON object. No markdown code fences. No preamble. Start with { and end with }.");
   }
 
-  // Inject tool schemas into the prompt so DeepSeek can "call" tools via structured text
-  const tools = body.tools || [];
+  // Inject tool schemas into the prompt ONLY for /v1/messages (Claude Code) requests.
+  // MAI uses /v1/chat/completions and handles tool routing on the SmartAssist side —
+  // injecting tool schemas there causes DeepSeek to output raw <tool_call> text.
+  const tools = body._injectTools ? (body.tools || []) : [];
   if (tools.length > 0) {
     const toolDefs = tools.map((t: any) => {
       const fn = t.function || t;
@@ -910,8 +912,8 @@ Bun.serve({
       // ── Convert Anthropic request → OpenAI request ──
       const oaiMessages: any[] = [];
 
-      // System message — tell DeepSeek to wrap reasoning in <think> tags so we can extract it
-      const suppressReasoning = "CRITICAL FORMATTING RULE: If you need to think or reason before responding, wrap ALL your internal thinking inside <think>...</think> tags. Everything inside <think> tags is hidden from the user. Everything OUTSIDE <think> tags is shown to the user. Never output reasoning, chain-of-thought, or planning outside of <think> tags. Example:\n<think>The user wants X. I should do Y.</think>\nHere is my response to the user.\n\n";
+      // System message — force DeepSeek to separate reasoning from response using a delimiter
+      const suppressReasoning = "RESPONSE FORMAT RULE: Start your response with ---RESPONSE--- on its own line. Everything before ---RESPONSE--- is your private thinking (hidden from user). Everything after ---RESPONSE--- is shown to the user. You MUST include ---RESPONSE--- in every reply. Example:\nI need to help with X.\n---RESPONSE---\nHere is my answer.\n\n";
       if (anthropicBody.system) {
         const systemText = typeof anthropicBody.system === "string"
           ? anthropicBody.system
@@ -986,7 +988,7 @@ Bun.serve({
       const oaiBody = {
         model: "deepseek-chat",
         messages: oaiMessages,
-        ...(oaiTools.length ? { tools: oaiTools, tool_choice: oaiToolChoice || "auto" } : {}),
+        ...(oaiTools.length ? { tools: oaiTools, tool_choice: oaiToolChoice || "auto", _injectTools: true } : {}),
         max_tokens: anthropicBody.max_tokens || 4096,
         temperature: anthropicBody.temperature,
         stream: isStream,
@@ -1113,13 +1115,21 @@ Bun.serve({
       const textAfterToolStrip = fullText.replace(/<(?:tool_call|_call|ool_call)>[\s\S]*?<\/tool_call>/g, "").trim();
       const hasToolCalls = parsedToolCalls.length > 0;
 
-      // Extract <think>...</think> blocks as hidden thinking content
+      // Split on ---RESPONSE--- delimiter — everything before is thinking (hidden), after is visible
       let thinkingText = "";
-      const thinkMatches = textAfterToolStrip.match(/<think>([\s\S]*?)<\/think>/g);
-      if (thinkMatches) {
-        thinkingText = thinkMatches.map(m => m.replace(/<\/?think>/g, "")).join("\n").trim();
+      let cleanText = textAfterToolStrip;
+      const delimIdx = textAfterToolStrip.indexOf("---RESPONSE---");
+      if (delimIdx !== -1) {
+        thinkingText = textAfterToolStrip.slice(0, delimIdx).trim();
+        cleanText = textAfterToolStrip.slice(delimIdx + "---RESPONSE---".length).trim();
       }
-      const cleanText = textAfterToolStrip.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+      // Also strip <think> tags as fallback
+      const thinkMatches = cleanText.match(/<think>([\s\S]*?)<\/think>/g);
+      if (thinkMatches) {
+        thinkingText += "\n" + thinkMatches.map(m => m.replace(/<\/?think>/g, "")).join("\n");
+        thinkingText = thinkingText.trim();
+        cleanText = cleanText.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+      }
 
       // Now emit Anthropic SSE events
       const stream = new ReadableStream({
