@@ -797,92 +797,13 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
     return calls;
   }
 
-  // Pattern 1: <tool_call>{"name":"...","input":{...}}</tool_call> (legacy custom format)
-  const p1 = /<(?:tool_call|_call|ool_call)>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g;
-  while ((m = p1.exec(text)) !== null) {
-    try {
-      const parsed = JSON.parse(m[1]);
-      if (parsed.name) {
-        calls.push({ name: parsed.name, input: parsed.input || parsed.parameters || {} });
-        console.log(`${tag} P1 match: ${parsed.name}(${JSON.stringify(parsed.input || {}).slice(0, 100)})`);
-      }
-    } catch (e) { console.warn(`${tag} P1 JSON parse failed: ${(e as any).message}`); }
-  }
-
-  // Pattern 2: <tool_calls><invoke name="..."><parameter name="..." ...>value</parameter></invoke></tool_calls>
-  // (Claude XML format that DeepSeek mimics)
-  const p2 = /<invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/invoke>/g;
-  while ((m = p2.exec(text)) !== null) {
-    const toolName = m[1];
-    const paramsBlock = m[2];
-    const params: Record<string, any> = {};
-    const paramRegex = /<parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/parameter>/g;
-    let pm;
-    while ((pm = paramRegex.exec(paramsBlock)) !== null) {
-      let val: any = pm[2].trim();
-      // Try to parse as JSON, fall back to string
-      try { val = JSON.parse(val); } catch { /* keep as string */ }
-      params[pm[1]] = val;
-    }
-    calls.push({ name: toolName, input: params });
-    console.log(`${tag} P2 match (XML): ${toolName}(${JSON.stringify(params).slice(0, 100)})`);
-  }
-
-  // Pattern 3: <tool_call name="entity"> {"action":"...","entity":"..."} </tool_call>
-  // (Hybrid format — tool name as XML attribute, params as JSON body)
-  const p3h = /<(?:tool_call|_call)\s+name="([^"]+)"[^>]*>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g;
-  while ((m = p3h.exec(text)) !== null) {
-    try {
-      const input = JSON.parse(m[2]);
-      calls.push({ name: m[1], input });
-      console.log(`${tag} P3h match (hybrid XML+JSON): ${m[1]}(${JSON.stringify(input).slice(0, 100)})`);
-    } catch (e) { console.warn(`${tag} P3h JSON parse failed: ${(e as any).message}`); }
-  }
-
-  // Pattern 4: Markdown code block with JSON tool call (DeepSeek outputs these frequently)
-  // ```json\n{"tool_call":"database","input":{...}}\n``` or ```\n{"name":"entity",...}\n```
-  if (calls.length === 0) {
-    const p4 = /```(?:json)?\s*\n?\s*\{\s*"(?:tool_call|name)"\s*:\s*"([^"]+)"\s*,\s*"(?:input|parameters|arguments)"\s*:\s*(\{[\s\S]*?\})\s*\}\s*\n?```/g;
-    while ((m = p4.exec(text)) !== null) {
-      try {
-        const input = JSON.parse(m[2]);
-        calls.push({ name: m[1], input });
-        console.log(`${tag} P4 match (markdown code block): ${m[1]}(${JSON.stringify(input).slice(0, 100)})`);
-      } catch (e) { console.warn(`${tag} P4 JSON parse failed: ${(e as any).message}`); }
-    }
-  }
-
-  // Pattern 5: {"name":"tool_name","parameters":{...}} bare JSON on its own line
-  if (calls.length === 0) {
-    const p5 = /\{"name"\s*:\s*"([^"]+)"\s*,\s*"(?:parameters|input|arguments)"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
-    while ((m = p5.exec(text)) !== null) {
-      try {
-        const input = JSON.parse(m[2]);
-        calls.push({ name: m[1], input });
-        console.log(`${tag} P5 match (bare JSON): ${m[1]}(${JSON.stringify(input).slice(0, 100)})`);
-      } catch { /* skip */ }
-    }
-  }
-
-  // Pattern 6: {"tool_call":"tool_name","input":{...}} — variant key name
-  if (calls.length === 0) {
-    const p6 = /\{"tool_call"\s*:\s*"([^"]+)"\s*,\s*"(?:input|parameters)"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
-    while ((m = p6.exec(text)) !== null) {
-      try {
-        const input = JSON.parse(m[2]);
-        calls.push({ name: m[1], input });
-        console.log(`${tag} P6 match (tool_call key): ${m[1]}(${JSON.stringify(input).slice(0, 100)})`);
-      } catch { /* skip */ }
-    }
-  }
-
   if (calls.length > 0) {
-    console.log(`${tag} ✓ extracted ${calls.length} tool call(s) from ${text.length} chars of text`);
+    console.log(`${tag} ✓ extracted ${calls.length} tool call(s) via DSML from ${text.length} chars`);
   } else if (text.length > 0) {
-    // Log when text contains tool-call-specific patterns (not generic JSON)
-    const hasToolishContent = /<tool_call|<DSML|<invoke\s+name=|"tool_call"\s*:\s*"/i.test(text);
-    if (hasToolishContent) {
-      console.warn(`${tag} ⚠ text contains tool call markers but no pattern matched. Preview: "${text.slice(0, 300).replace(/\n/g, "\\n")}"`);
+    // Log when text contains DSML markers but parser didn't match
+    const hasDSML = /<[｜|]?DSML[｜|]/i.test(text);
+    if (hasDSML) {
+      console.warn(`${tag} ⚠ text contains DSML markers but parser didn't match. Preview: "${text.slice(0, 300).replace(/\n/g, "\\n")}"`);
     }
   }
   return calls;
@@ -890,17 +811,8 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
 
 function stripToolCallText(text: string): string {
   return text
-    // DSML format (full-width and ASCII pipes, optional leading pipe)
     .replace(/<[｜|]?DSML[｜|]tool_calls>[\s\S]*?<\/[｜|]?DSML[｜|]tool_calls>/g, "")
     .replace(/<[｜|]?DSML[｜|]invoke[\s\S]*?<\/[｜|]?DSML[｜|]invoke>/g, "")
-    // Legacy custom format
-    .replace(/<(?:tool_call|_call|ool_call)[^>]*>[\s\S]*?<\/tool_call>/g, "")
-    .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/g, "")
-    .replace(/<invoke\s+name="[^"]*"[\s\S]*?<\/invoke>/g, "")
-    // Markdown code block format
-    .replace(/```(?:json)?\s*\n?\s*\{\s*"(?:tool_call|name)"[\s\S]*?\}\s*\n?```/g, "")
-    // Bare JSON format
-    .replace(/\{"(?:tool_call|name)"\s*:\s*"[^"]+"\s*,\s*"(?:input|parameters|arguments)"\s*:\s*\{[\s\S]*?\}\s*\}/g, "")
     .trim();
 }
 
@@ -1145,16 +1057,13 @@ Bun.serve({
       const oaiMessages: any[] = [];
 
       // System message — force DeepSeek to separate reasoning from response using a delimiter
-      const suppressReasoning = "RESPONSE FORMAT RULE: Start your response with ---RESPONSE--- on its own line. Everything before ---RESPONSE--- is your private thinking (hidden from user). Everything after ---RESPONSE--- is shown to the user. You MUST include ---RESPONSE--- in every reply. Example:\nI need to help with X.\n---RESPONSE---\nHere is my answer.\n\n";
       if (anthropicBody.system) {
         const systemText = typeof anthropicBody.system === "string"
           ? anthropicBody.system
           : Array.isArray(anthropicBody.system)
             ? anthropicBody.system.map((b: any) => b.text || "").join("\n\n")
             : "";
-        if (systemText) oaiMessages.push({ role: "system", content: suppressReasoning + systemText });
-      } else {
-        oaiMessages.push({ role: "system", content: suppressReasoning.trim() });
+        if (systemText) oaiMessages.push({ role: "system", content: systemText });
       }
 
       // Convert messages
@@ -1244,25 +1153,11 @@ Bun.serve({
         const contentBlocks: any[] = [];
         let rawText = choice.message?.content || "";
 
-        // Parse tool calls from text output (DeepSeek web API doesn't support native tool calling)
-        const toolCallRegex = /<(?:tool_call|_call|ool_call)>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g;
-        const textToolCalls: Array<{ name: string; input: any }> = [];
-        let match;
-        while ((match = toolCallRegex.exec(rawText)) !== null) {
-          try {
-            const parsed = JSON.parse(match[1]);
-            if (parsed.name) textToolCalls.push({ name: parsed.name, input: parsed.input || parsed.parameters || {} });
-          } catch { /* skip malformed */ }
-        }
+        // Parse DSML tool calls from text output
+        const textToolCalls = extractToolCallsFromText(rawText, rid);
 
-        // Extract <think> blocks as thinking content (hidden in Claude Code)
-        const strippedToolCalls = rawText.replace(/<(?:tool_call|_call|ool_call)>[\s\S]*?<\/tool_call>/g, "");
-        const thinkBlocks = strippedToolCalls.match(/<think>([\s\S]*?)<\/think>/g);
-        if (thinkBlocks) {
-          const thinking = thinkBlocks.map(m => m.replace(/<\/?think>/g, "")).join("\n").trim();
-          if (thinking) contentBlocks.push({ type: "thinking", thinking });
-        }
-        const visibleText = strippedToolCalls.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+        // Strip DSML and extract visible text
+        const visibleText = stripToolCallText(rawText).trim();
         if (visibleText) contentBlocks.push({ type: "text", text: visibleText });
 
         for (const tc of textToolCalls) {
@@ -1334,34 +1229,14 @@ Bun.serve({
         }
       }
 
-      // Parse tool calls from collected text
-      const toolCallRegex = /<(?:tool_call|_call|ool_call)>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g;
-      const parsedToolCalls: Array<{ name: string; input: any }> = [];
-      let tcMatch;
-      while ((tcMatch = toolCallRegex.exec(fullText)) !== null) {
-        try {
-          const parsed = JSON.parse(tcMatch[1]);
-          if (parsed.name) parsedToolCalls.push({ name: parsed.name, input: parsed.input || parsed.parameters || {} });
-        } catch { /* skip malformed */ }
-      }
-      const textAfterToolStrip = fullText.replace(/<(?:tool_call|_call|ool_call)>[\s\S]*?<\/tool_call>/g, "").trim();
+      // Parse DSML tool calls from collected text
+      const parsedToolCalls = extractToolCallsFromText(fullText, rid);
+      const textAfterToolStrip = stripToolCallText(fullText);
       const hasToolCalls = parsedToolCalls.length > 0;
 
-      // Split on ---RESPONSE--- delimiter — everything before is thinking (hidden), after is visible
-      let thinkingText = "";
-      let cleanText = textAfterToolStrip;
-      const delimIdx = textAfterToolStrip.indexOf("---RESPONSE---");
-      if (delimIdx !== -1) {
-        thinkingText = textAfterToolStrip.slice(0, delimIdx).trim();
-        cleanText = textAfterToolStrip.slice(delimIdx + "---RESPONSE---".length).trim();
-      }
-      // Also strip <think> tags as fallback
-      const thinkMatches = cleanText.match(/<think>([\s\S]*?)<\/think>/g);
-      if (thinkMatches) {
-        thinkingText += "\n" + thinkMatches.map(m => m.replace(/<\/?think>/g, "")).join("\n");
-        thinkingText = thinkingText.trim();
-        cleanText = cleanText.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-      }
+      // Clean text for display
+      const thinkingText = "";
+      const cleanText = textAfterToolStrip;
 
       // Now emit Anthropic SSE events
       const stream = new ReadableStream({
