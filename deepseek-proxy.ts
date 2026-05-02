@@ -637,10 +637,21 @@ Never quote or echo tool result data in your response — summarize it naturally
         : "";
     if (!text) continue;
     if (msg.role === "system") parts.push(`[SYSTEM]\n${text}`);
-    else if (msg.role === "assistant") parts.push(`[ASSISTANT]\n${text}`);
-    else if (msg.role === "tool") {
-      // Format tool results as data context, not as echoed text.
-      // "The tool returned:" framing prevents the model from quoting the raw format.
+    else if (msg.role === "assistant") {
+      // Include tool calls the assistant made (so DeepSeek has context of its own actions)
+      const toolCalls = (msg as any).tool_calls;
+      if (toolCalls?.length) {
+        const callsText = toolCalls.map((tc: any) => {
+          const name = tc.function?.name || tc.name || "unknown";
+          const args = tc.function?.arguments || JSON.stringify(tc.input || {});
+          return `<tool_call>{"name":"${name}","input":${args}}</tool_call>`;
+        }).join("\n");
+        parts.push(`[ASSISTANT]\n${text ? text + "\n" : ""}${callsText}`);
+      } else if (text) {
+        parts.push(`[ASSISTANT]\n${text}`);
+      }
+    } else if (msg.role === "tool") {
+      // Format tool results naturally — prevents the model from quoting raw format
       parts.push(`The tool returned the following data:\n${text}`);
     } else parts.push(text);
   }
