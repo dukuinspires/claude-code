@@ -52,7 +52,6 @@ gcloud run deploy "$SERVICE" \
   --timeout 900 \
   --min-instances 1 \
   --max-instances 3 \
-  --no-allow-unauthenticated \
   --update-env-vars "DS_PROXY_PORT=3098,SMARTASSIST_URL=${SMARTASSIST_URL},VPS_PROXY_URL=${VPS_NODE1},SMTP_PROXY_SECRET=${VPS_SECRET}" \
   --update-secrets "INTERNAL_AUTH_TOKEN=internal-auth-token:latest,DS_USER_TOKEN=ds-user-token:latest"
 

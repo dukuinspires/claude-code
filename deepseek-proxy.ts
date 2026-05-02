@@ -1108,8 +1108,27 @@ Bun.serve({
           if (parsed.name) parsedToolCalls.push({ name: parsed.name, input: parsed.input || parsed.parameters || {} });
         } catch { /* skip malformed */ }
       }
-      const cleanText = fullText.replace(/<(?:tool_call|_call|ool_call)>[\s\S]*?<\/tool_call>/g, "").trim();
+      const textAfterToolStrip = fullText.replace(/<(?:tool_call|_call|ool_call)>[\s\S]*?<\/tool_call>/g, "").trim();
       const hasToolCalls = parsedToolCalls.length > 0;
+
+      // Separate thinking/reasoning from actual response content.
+      // DeepSeek outputs reasoning like "The user asked... I should..." before the answer.
+      // We emit reasoning as a "thinking" content block (hidden in Claude Code by default).
+      let thinkingText = "";
+      let cleanText = textAfterToolStrip;
+
+      // Pattern: reasoning starts at the beginning, actual response follows after reasoning phrases
+      const reasoningPatterns = /^((?:(?:The (?:user|question|request|task|person|developer|message)|I (?:need|should|will|can|want|have|see|notice|understand|think|am)|Let me|This is|Here|Okay|Alright|So |First|We |My )[\s\S]*?)(?=\n\n|\n(?=[A-Z])|$))/;
+      const reasoningMatch = cleanText.match(reasoningPatterns);
+      if (reasoningMatch && reasoningMatch[1]) {
+        // Check if the reasoning is followed by actual content
+        const afterReasoning = cleanText.slice(reasoningMatch[1].length).trim();
+        if (afterReasoning) {
+          thinkingText = reasoningMatch[1].trim();
+          cleanText = afterReasoning;
+        }
+        // If reasoning IS the entire response, keep it as text (no separate thinking block)
+      }
 
       // Now emit Anthropic SSE events
       const stream = new ReadableStream({
@@ -1130,6 +1149,14 @@ Bun.serve({
           });
 
           let blockIndex = 0;
+
+          // Emit thinking block (hidden in Claude Code by default)
+          if (thinkingText) {
+            emit("content_block_start", { type: "content_block_start", index: blockIndex, content_block: { type: "thinking", thinking: "" } });
+            emit("content_block_delta", { type: "content_block_delta", index: blockIndex, delta: { type: "thinking_delta", thinking: thinkingText } });
+            emit("content_block_stop", { type: "content_block_stop", index: blockIndex });
+            blockIndex++;
+          }
 
           // Emit text block (if any clean text exists)
           if (cleanText) {
