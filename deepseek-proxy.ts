@@ -862,6 +862,246 @@ Bun.serve({
       });
     }
 
+    // ── Anthropic Messages endpoint (for Claude Code compatibility) ────────
+    // Accepts Anthropic /v1/messages format, converts to OpenAI, runs through
+    // the DeepSeek completion pipeline, converts response back to Anthropic.
+    if (url.pathname === "/v1/messages" && req.method === "POST") {
+      const anthropicBody = await req.json() as any;
+      const isStream = !!anthropicBody.stream;
+      console.log(`[ds-proxy] [${rid}] /v1/messages (Anthropic) model=${anthropicBody.model} stream=${isStream} msgs=${anthropicBody.messages?.length ?? 0}`);
+
+      // ── Convert Anthropic request → OpenAI request ──
+      const oaiMessages: any[] = [];
+
+      // System message
+      if (anthropicBody.system) {
+        const systemText = typeof anthropicBody.system === "string"
+          ? anthropicBody.system
+          : Array.isArray(anthropicBody.system)
+            ? anthropicBody.system.map((b: any) => b.text || "").join("\n\n")
+            : "";
+        if (systemText) oaiMessages.push({ role: "system", content: systemText });
+      }
+
+      // Convert messages
+      for (const msg of (anthropicBody.messages || [])) {
+        if (msg.role === "user") {
+          if (typeof msg.content === "string") {
+            oaiMessages.push({ role: "user", content: msg.content });
+          } else if (Array.isArray(msg.content)) {
+            // Handle text blocks and tool_result blocks
+            const textParts = msg.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n");
+            const toolResults = msg.content.filter((b: any) => b.type === "tool_result");
+            if (textParts) oaiMessages.push({ role: "user", content: textParts });
+            for (const tr of toolResults) {
+              oaiMessages.push({
+                role: "tool",
+                tool_call_id: tr.tool_use_id,
+                content: typeof tr.content === "string" ? tr.content : JSON.stringify(tr.content),
+              });
+            }
+          }
+        } else if (msg.role === "assistant") {
+          if (typeof msg.content === "string") {
+            oaiMessages.push({ role: "assistant", content: msg.content });
+          } else if (Array.isArray(msg.content)) {
+            const textParts = msg.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
+            const toolUses = msg.content.filter((b: any) => b.type === "tool_use");
+            const assistantMsg: any = { role: "assistant", content: textParts || null };
+            if (toolUses.length) {
+              assistantMsg.tool_calls = toolUses.map((tu: any) => ({
+                id: tu.id,
+                type: "function",
+                function: {
+                  name: tu.name,
+                  arguments: typeof tu.input === "string" ? tu.input : JSON.stringify(tu.input || {}),
+                },
+              }));
+            }
+            oaiMessages.push(assistantMsg);
+          }
+        }
+      }
+
+      // Convert Anthropic tools → OpenAI tools
+      const oaiTools = (anthropicBody.tools || []).map((t: any) => ({
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description || "",
+          parameters: t.input_schema || { type: "object", properties: {} },
+        },
+      }));
+
+      // Convert tool_choice
+      let oaiToolChoice: any = undefined;
+      if (anthropicBody.tool_choice) {
+        if (anthropicBody.tool_choice.type === "auto") oaiToolChoice = "auto";
+        else if (anthropicBody.tool_choice.type === "none") oaiToolChoice = "none";
+        else if (anthropicBody.tool_choice.type === "any") oaiToolChoice = "required";
+        else if (anthropicBody.tool_choice.type === "tool") oaiToolChoice = { type: "function", function: { name: anthropicBody.tool_choice.name } };
+      }
+
+      // Build OpenAI-format body and process through existing pipeline
+      const oaiBody = {
+        model: "deepseek-chat",
+        messages: oaiMessages,
+        ...(oaiTools.length ? { tools: oaiTools, tool_choice: oaiToolChoice || "auto" } : {}),
+        max_tokens: anthropicBody.max_tokens || 4096,
+        temperature: anthropicBody.temperature,
+        stream: isStream,
+        model_type: "expert",
+        ...(anthropicBody.thinking ? { thinking_enabled: true } : {}),
+      };
+
+      // Route through the same completion pipeline as /v1/chat/completions
+      const oaiResponse = await fetch(`http://localhost:${PORT}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "authorization": req.headers.get("authorization") || "" },
+        body: JSON.stringify(oaiBody),
+      });
+
+      if (!isStream) {
+        // ── Non-streaming: convert OAI response → Anthropic response ──
+        const oaiResult = await oaiResponse.json() as any;
+        const choice = oaiResult.choices?.[0];
+        if (!choice) return Response.json({ error: "No response from model" }, { status: 502 });
+
+        const contentBlocks: any[] = [];
+        if (choice.message?.content) {
+          contentBlocks.push({ type: "text", text: choice.message.content });
+        }
+        if (choice.message?.tool_calls) {
+          for (const tc of choice.message.tool_calls) {
+            contentBlocks.push({
+              type: "tool_use",
+              id: tc.id || `toolu_${Math.random().toString(36).slice(2, 12)}`,
+              name: tc.function.name,
+              input: (() => { try { return JSON.parse(tc.function.arguments); } catch { return {}; } })(),
+            });
+          }
+        }
+
+        const stopReason = choice.finish_reason === "tool_calls" ? "tool_use"
+          : choice.finish_reason === "length" ? "max_tokens"
+          : "end_turn";
+
+        return Response.json({
+          id: oaiResult.id || `msg_${Date.now()}`,
+          type: "message",
+          role: "assistant",
+          model: anthropicBody.model || "deepseek-v4-pro",
+          content: contentBlocks,
+          stop_reason: stopReason,
+          usage: {
+            input_tokens: oaiResult.usage?.prompt_tokens || 0,
+            output_tokens: oaiResult.usage?.completion_tokens || 0,
+          },
+        });
+      }
+
+      // ── Streaming: convert OAI SSE → Anthropic SSE ──
+      const te = new TextEncoder();
+      const stream = new ReadableStream({
+        async start(controller) {
+          const emit = (event: string, data: any) => {
+            controller.enqueue(te.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+          };
+
+          const msgId = `msg_${Date.now()}`;
+          emit("message_start", {
+            type: "message_start",
+            message: {
+              id: msgId, type: "message", role: "assistant",
+              model: anthropicBody.model || "deepseek-v4-pro",
+              content: [], stop_reason: null,
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
+          });
+
+          let blockIndex = 0;
+          let currentBlockType: "text" | "tool_use" | null = null;
+          let textBlockStarted = false;
+
+          const reader = oaiResponse.body!.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+              if (!line.startsWith("data:")) continue;
+              const data = line.slice(5).trim();
+              if (data === "[DONE]") continue;
+              try {
+                const chunk = JSON.parse(data);
+                const delta = chunk.choices?.[0]?.delta;
+                const finishReason = chunk.choices?.[0]?.finish_reason;
+
+                // Text content
+                if (delta?.content) {
+                  if (!textBlockStarted) {
+                    emit("content_block_start", { type: "content_block_start", index: blockIndex, content_block: { type: "text", text: "" } });
+                    textBlockStarted = true;
+                    currentBlockType = "text";
+                  }
+                  emit("content_block_delta", { type: "content_block_delta", index: blockIndex, delta: { type: "text_delta", text: delta.content } });
+                }
+
+                // Tool call start
+                if (delta?.tool_calls) {
+                  for (const tc of delta.tool_calls) {
+                    if (tc.function?.name) {
+                      // Close previous text block if open
+                      if (textBlockStarted) {
+                        emit("content_block_stop", { type: "content_block_stop", index: blockIndex });
+                        blockIndex++;
+                        textBlockStarted = false;
+                      }
+                      // Start tool_use block
+                      emit("content_block_start", {
+                        type: "content_block_start", index: blockIndex,
+                        content_block: { type: "tool_use", id: tc.id || `toolu_${Math.random().toString(36).slice(2, 12)}`, name: tc.function.name, input: {} },
+                      });
+                      currentBlockType = "tool_use";
+                    }
+                    if (tc.function?.arguments) {
+                      emit("content_block_delta", {
+                        type: "content_block_delta", index: blockIndex,
+                        delta: { type: "input_json_delta", partial_json: tc.function.arguments },
+                      });
+                    }
+                  }
+                }
+
+                // Finish
+                if (finishReason) {
+                  if (currentBlockType) {
+                    emit("content_block_stop", { type: "content_block_stop", index: blockIndex });
+                  }
+                  const stopReason = finishReason === "tool_calls" ? "tool_use"
+                    : finishReason === "length" ? "max_tokens"
+                    : "end_turn";
+                  emit("message_delta", { type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: 0 } });
+                  emit("message_stop", { type: "message_stop" });
+                }
+              } catch { /* skip malformed chunk */ }
+            }
+          }
+          controller.close();
+        },
+      });
+
+      return new Response(stream, {
+        headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+      });
+    }
+
     // ── Chat completions ──────────────────────────────────────────────────────
     if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
       const body = await req.json() as any;
