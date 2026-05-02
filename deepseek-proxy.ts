@@ -677,7 +677,12 @@ When you need to call a tool, use DSML format:
 string="true" for string values, string="false" for numbers/booleans/objects/arrays (use JSON for those).
 Multiple tool calls: multiple <|DSML|invoke> blocks inside one <|DSML|tool_calls>.
 After tool calls, stop — do not add text after </|DSML|tool_calls>.
-Never echo tool result data — summarize naturally.${choiceHint}`);
+
+CRITICAL RULES:
+- When you receive tool results, use ONLY the actual data returned. NEVER fabricate, invent, or substitute names, values, counts, or any other data.
+- If a tool returns campaign names, contact names, or any identifiers — use those EXACT values in your response.
+- If you need data you don't have, call a tool to get it. NEVER guess or make up data.
+- Never echo raw tool result JSON — present the data naturally.${choiceHint}`);
 
     console.log(`[ds-proxy] [${rid}] [openAIToDS] injected ${tools.length} DSML tool schemas, tool_choice=${typeof toolChoice === "object" ? JSON.stringify(toolChoice) : toolChoice || "auto"}`);
   }
@@ -720,13 +725,31 @@ Never echo tool result data — summarize naturally.${choiceHint}`);
         assistantCount++;
       }
     } else if (msg.role === "tool") {
-      // Format tool results naturally
-      parts.push(`Tool result:\n${text}`);
+      // Tool results are AUTHORITATIVE data from the platform — label them clearly
+      // so DeepSeek treats them as ground truth, not optional context to hallucinate over.
+      const toolCallId = (msg as any).tool_call_id || "";
+      parts.push(`[TOOL RESULT${toolCallId ? ` id=${toolCallId}` : ""}]\nThe following is real data returned by the tool. Use ONLY this data in your response — do not invent, fabricate, or substitute any values:\n${text}`);
       toolResultCount++;
     } else if (text) {
       parts.push(text);
       userCount++;
     }
+  }
+
+  // If tool results are present, inject a final grounding turn right before generation.
+  // At 100K+ char prompts with 42 tool schemas, the [TOOL RESULT] label alone gets
+  // diluted. This synthetic [USER] turn is the LAST thing DeepSeek reads — it forces
+  // attention back to the actual data before it generates.
+  if (toolResultCount > 0) {
+    parts.push(
+      `[USER]\n` +
+      `⚠️ GROUNDING REQUIRED: You MUST respond using ONLY the exact values from the [TOOL RESULT] blocks above.\n` +
+      `- Do NOT invent, fabricate, substitute, or paraphrase any names, IDs, counts, prices, or other data.\n` +
+      `- If a tool returned campaign names → use those EXACT names. If it returned contact names → use those EXACT names.\n` +
+      `- NEVER guess or hallucinate data you did not receive from a tool result.\n` +
+      `- If unsure, call another tool to get the data rather than making it up.`
+    );
+    userCount++;
   }
 
   const prompt = parts.join("\n\n");
@@ -1397,9 +1420,23 @@ Bun.serve({
                 // Capture both bare text chunks AND APPEND events (which have event.p set)
                 fullText += event.v;
                 chunkCount++;
-              } else if (event.v?.response?.fragments) {
-                for (const frag of event.v.response.fragments) {
-                  if (frag.content) { fullText += frag.content; chunkCount++; }
+              } else if (typeof event.v === "object" && event.v !== null) {
+                // Check for fragment arrays (JSON Patch replace on response/fragments)
+                if (Array.isArray(event.v)) {
+                  for (const frag of event.v) {
+                    if (frag?.content) { fullText += frag.content; chunkCount++; }
+                  }
+                } else if (event.v?.response?.fragments) {
+                  for (const frag of event.v.response.fragments) {
+                    if (frag.content) { fullText += frag.content; chunkCount++; }
+                  }
+                } else if (event.v?.content && typeof event.v.content === "string") {
+                  // Fragment object with content field directly
+                  fullText += event.v.content;
+                  chunkCount++;
+                } else if (chunkCount < 5) {
+                  // Log first few unhandled object events for diagnostics
+                  console.log(`[ds-proxy] [${rid}] [sse-diag] unhandled object event: ${JSON.stringify(event).slice(0, 300)}`);
                 }
               }
             } catch { /* skip */ }
@@ -1476,8 +1513,14 @@ Bun.serve({
         try {
           const event = JSON.parse(data);
           if (event.v && typeof event.v === "string") fullText += event.v;
-          else if (event.v?.response?.fragments) {
-            for (const f of event.v.response.fragments) if (f.content) fullText += f.content;
+          else if (typeof event.v === "object" && event.v !== null) {
+            if (Array.isArray(event.v)) {
+              for (const f of event.v) if (f?.content) fullText += f.content;
+            } else if (event.v?.response?.fragments) {
+              for (const f of event.v.response.fragments) if (f.content) fullText += f.content;
+            } else if (event.v?.content && typeof event.v.content === "string") {
+              fullText += event.v.content;
+            }
           }
         } catch { /* skip */ }
       }
