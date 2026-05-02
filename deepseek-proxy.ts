@@ -618,6 +618,32 @@ function openAIToDS(body: any, sessionId: string) {
     parts.push("IMPORTANT: Respond with ONLY a raw JSON object. No markdown code fences. No preamble. Start with { and end with }.");
   }
 
+  // Inject tool schemas into the prompt so DeepSeek can "call" tools via structured text
+  const tools = body.tools || [];
+  if (tools.length > 0) {
+    const toolDefs = tools.map((t: any) => {
+      const fn = t.function || t;
+      const params = fn.parameters || fn.input_schema || {};
+      const requiredFields = params.required || [];
+      const propsList = Object.entries(params.properties || {}).map(([k, v]: [string, any]) => {
+        const req = requiredFields.includes(k) ? " (required)" : "";
+        return `    - ${k}${req}: ${v.description || v.type || "any"}`;
+      }).join("\n");
+      return `- ${fn.name}: ${fn.description || ""}\n  Parameters:\n${propsList || "    (none)"}`;
+    }).join("\n\n");
+
+    parts.push(`[TOOL DEFINITIONS]
+You have access to these tools. To call a tool, output EXACTLY this format on its own line:
+<tool_call>{"name":"tool_name","input":{"param":"value"}}</tool_call>
+
+You may call multiple tools. Each tool call must be on its own line in the exact format above.
+After outputting tool calls, STOP. Do not add any text after the tool calls.
+If you don't need to call a tool, respond normally with text.
+
+Available tools:
+${toolDefs}`);
+  }
+
   for (const msg of messages) {
     const text = typeof msg.content === "string"
       ? msg.content
@@ -627,7 +653,9 @@ function openAIToDS(body: any, sessionId: string) {
     if (!text) continue;
     if (msg.role === "system") parts.push(`[SYSTEM]\n${text}`);
     else if (msg.role === "assistant") parts.push(`[ASSISTANT]\n${text}`);
-    else parts.push(text);
+    else if (msg.role === "tool") {
+      parts.push(`[TOOL RESULT for ${(msg as any).tool_call_id || "unknown"}]\n${text}`);
+    } else parts.push(text);
   }
 
   return {
@@ -980,9 +1008,37 @@ Bun.serve({
         if (!choice) return Response.json({ error: "No response from model" }, { status: 502 });
 
         const contentBlocks: any[] = [];
-        if (choice.message?.content) {
-          contentBlocks.push({ type: "text", text: choice.message.content });
+        let rawText = choice.message?.content || "";
+
+        // Parse tool calls from text output (DeepSeek web API doesn't support native tool calling)
+        const toolCallRegex = /<(?:tool_call|_call|ool_call)>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g;
+        const textToolCalls: Array<{ name: string; input: any }> = [];
+        let match;
+        while ((match = toolCallRegex.exec(rawText)) !== null) {
+          try {
+            const parsed = JSON.parse(match[1]);
+            if (parsed.name) textToolCalls.push({ name: parsed.name, input: parsed.input || parsed.parameters || {} });
+          } catch { /* skip malformed */ }
         }
+
+        if (textToolCalls.length > 0) {
+          // Strip tool calls and any reasoning from the text
+          const cleanText = rawText.replace(/<(?:tool_call|_call|ool_call)>[\s\S]*?<\/tool_call>/g, "").trim();
+          if (cleanText) contentBlocks.push({ type: "text", text: cleanText });
+          for (const tc of textToolCalls) {
+            contentBlocks.push({
+              type: "tool_use",
+              id: `toolu_${Math.random().toString(36).slice(2, 12)}`,
+              name: tc.name,
+              input: tc.input,
+            });
+          }
+        } else {
+          // No tool calls — pass text through
+          if (rawText) contentBlocks.push({ type: "text", text: rawText });
+        }
+
+        // Also handle native OpenAI tool_calls if present
         if (choice.message?.tool_calls) {
           for (const tc of choice.message.tool_calls) {
             contentBlocks.push({
@@ -994,7 +1050,8 @@ Bun.serve({
           }
         }
 
-        const stopReason = choice.finish_reason === "tool_calls" ? "tool_use"
+        const hasToolUse = contentBlocks.some(b => b.type === "tool_use");
+        const stopReason = hasToolUse ? "tool_use"
           : choice.finish_reason === "length" ? "max_tokens"
           : "end_turn";
 
@@ -1012,10 +1069,51 @@ Bun.serve({
         });
       }
 
-      // ── Streaming: convert OAI SSE → Anthropic SSE ──
+      // ── Streaming: collect full response, then emit Anthropic events ──
+      // DeepSeek web API doesn't support native tool calling, so tool calls
+      // arrive as <tool_call>...</tool_call> text. We buffer the full response,
+      // parse tool calls, then emit proper Anthropic content blocks.
       const te = new TextEncoder();
+
+      // Collect the full streamed response first
+      let fullText = "";
+      const reader = oaiResponse.body!.getReader();
+      const decoder = new TextDecoder();
+      let sseBuffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        sseBuffer += decoder.decode(value, { stream: true });
+        const lines = sseBuffer.split("\n");
+        sseBuffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") continue;
+          try {
+            const chunk = JSON.parse(data);
+            const content = chunk.choices?.[0]?.delta?.content;
+            if (content) fullText += content;
+          } catch { /* skip */ }
+        }
+      }
+
+      // Parse tool calls from collected text
+      const toolCallRegex = /<(?:tool_call|_call|ool_call)>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g;
+      const parsedToolCalls: Array<{ name: string; input: any }> = [];
+      let tcMatch;
+      while ((tcMatch = toolCallRegex.exec(fullText)) !== null) {
+        try {
+          const parsed = JSON.parse(tcMatch[1]);
+          if (parsed.name) parsedToolCalls.push({ name: parsed.name, input: parsed.input || parsed.parameters || {} });
+        } catch { /* skip malformed */ }
+      }
+      const cleanText = fullText.replace(/<(?:tool_call|_call|ool_call)>[\s\S]*?<\/tool_call>/g, "").trim();
+      const hasToolCalls = parsedToolCalls.length > 0;
+
+      // Now emit Anthropic SSE events
       const stream = new ReadableStream({
-        async start(controller) {
+        start(controller) {
           const emit = (event: string, data: any) => {
             controller.enqueue(te.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
           };
@@ -1032,79 +1130,35 @@ Bun.serve({
           });
 
           let blockIndex = 0;
-          let currentBlockType: "text" | "tool_use" | null = null;
-          let textBlockStarted = false;
 
-          const reader = oaiResponse.body!.getReader();
-          const decoder = new TextDecoder();
-          let buffer = "";
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-
-            for (const line of lines) {
-              if (!line.startsWith("data:")) continue;
-              const data = line.slice(5).trim();
-              if (data === "[DONE]") continue;
-              try {
-                const chunk = JSON.parse(data);
-                const delta = chunk.choices?.[0]?.delta;
-                const finishReason = chunk.choices?.[0]?.finish_reason;
-
-                // Text content
-                if (delta?.content) {
-                  if (!textBlockStarted) {
-                    emit("content_block_start", { type: "content_block_start", index: blockIndex, content_block: { type: "text", text: "" } });
-                    textBlockStarted = true;
-                    currentBlockType = "text";
-                  }
-                  emit("content_block_delta", { type: "content_block_delta", index: blockIndex, delta: { type: "text_delta", text: delta.content } });
-                }
-
-                // Tool call start
-                if (delta?.tool_calls) {
-                  for (const tc of delta.tool_calls) {
-                    if (tc.function?.name) {
-                      // Close previous text block if open
-                      if (textBlockStarted) {
-                        emit("content_block_stop", { type: "content_block_stop", index: blockIndex });
-                        blockIndex++;
-                        textBlockStarted = false;
-                      }
-                      // Start tool_use block
-                      emit("content_block_start", {
-                        type: "content_block_start", index: blockIndex,
-                        content_block: { type: "tool_use", id: tc.id || `toolu_${Math.random().toString(36).slice(2, 12)}`, name: tc.function.name, input: {} },
-                      });
-                      currentBlockType = "tool_use";
-                    }
-                    if (tc.function?.arguments) {
-                      emit("content_block_delta", {
-                        type: "content_block_delta", index: blockIndex,
-                        delta: { type: "input_json_delta", partial_json: tc.function.arguments },
-                      });
-                    }
-                  }
-                }
-
-                // Finish
-                if (finishReason) {
-                  if (currentBlockType) {
-                    emit("content_block_stop", { type: "content_block_stop", index: blockIndex });
-                  }
-                  const stopReason = finishReason === "tool_calls" ? "tool_use"
-                    : finishReason === "length" ? "max_tokens"
-                    : "end_turn";
-                  emit("message_delta", { type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: 0 } });
-                  emit("message_stop", { type: "message_stop" });
-                }
-              } catch { /* skip malformed chunk */ }
-            }
+          // Emit text block (if any clean text exists)
+          if (cleanText) {
+            emit("content_block_start", { type: "content_block_start", index: blockIndex, content_block: { type: "text", text: "" } });
+            emit("content_block_delta", { type: "content_block_delta", index: blockIndex, delta: { type: "text_delta", text: cleanText } });
+            emit("content_block_stop", { type: "content_block_stop", index: blockIndex });
+            blockIndex++;
           }
+
+          // Emit tool_use blocks
+          for (const tc of parsedToolCalls) {
+            const toolId = `toolu_${Math.random().toString(36).slice(2, 12)}`;
+            emit("content_block_start", {
+              type: "content_block_start", index: blockIndex,
+              content_block: { type: "tool_use", id: toolId, name: tc.name, input: {} },
+            });
+            emit("content_block_delta", {
+              type: "content_block_delta", index: blockIndex,
+              delta: { type: "input_json_delta", partial_json: JSON.stringify(tc.input) },
+            });
+            emit("content_block_stop", { type: "content_block_stop", index: blockIndex });
+            blockIndex++;
+          }
+
+          // Message end
+          const stopReason = hasToolCalls ? "tool_use" : "end_turn";
+          emit("message_delta", { type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: 0 } });
+          emit("message_stop", { type: "message_stop" });
+
           controller.close();
         },
       });
