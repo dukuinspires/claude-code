@@ -767,8 +767,8 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
 
   // Pattern 0 (HIGHEST PRIORITY): DSML format — DeepSeek's native trained format
   // Matches both full-width ｜ and ASCII | pipes
-  const dsmlInvokeRegex = /<[｜|]DSML[｜|]invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/[｜|]DSML[｜|]invoke>/g;
-  const dsmlParamRegex = /<[｜|]DSML[｜|]parameter\s+name="([^"]+)"\s+string="(true|false)"[^>]*>([\s\S]*?)<[\/]?[｜|]DSML[｜|]parameter>/g;
+  const dsmlInvokeRegex = /<[｜|]?DSML[｜|]invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/[｜|]?DSML[｜|]invoke>/g;
+  const dsmlParamRegex = /<[｜|]?DSML[｜|]parameter\s+name="([^"]+)"\s+string="(true|false)"[^>]*>([\s\S]*?)<[\/]?[｜|]?DSML[｜|]parameter>/g;
   let m;
   while ((m = dsmlInvokeRegex.exec(text)) !== null) {
     if (isInCodeBlock(m.index)) { console.log(`${tag} P0 DSML match skipped (inside code block)`); continue; }
@@ -890,9 +890,9 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
 
 function stripToolCallText(text: string): string {
   return text
-    // DSML format (full-width and ASCII pipes)
-    .replace(/<[｜|]DSML[｜|]tool_calls>[\s\S]*?<\/[｜|]DSML[｜|]tool_calls>/g, "")
-    .replace(/<[｜|]DSML[｜|]invoke[\s\S]*?<\/[｜|]DSML[｜|]invoke>/g, "")
+    // DSML format (full-width and ASCII pipes, optional leading pipe)
+    .replace(/<[｜|]?DSML[｜|]tool_calls>[\s\S]*?<\/[｜|]?DSML[｜|]tool_calls>/g, "")
+    .replace(/<[｜|]?DSML[｜|]invoke[\s\S]*?<\/[｜|]?DSML[｜|]invoke>/g, "")
     // Legacy custom format
     .replace(/<(?:tool_call|_call|ool_call)[^>]*>[\s\S]*?<\/tool_call>/g, "")
     .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/g, "")
