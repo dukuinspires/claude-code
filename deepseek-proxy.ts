@@ -849,81 +849,63 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
     parts.push("IMPORTANT: Respond with ONLY a raw JSON object. No markdown code fences. No preamble. Start with { and end with }.");
   }
 
-  // ── Tool calling bridge (DSML-native) ──────────────────────────────────────
-  // DeepSeek V3/V4 was TRAINED to output tool calls in DSML format.
-  // Instead of fighting the model's training with custom <tool_call> tags,
-  // we align with it by injecting DSML-formatted tool schemas and examples.
-  // The paid API does this conversion internally — we replicate it here.
+  // ── Tool calling bridge — official DSML template ──────────────────────────
+  // Source: DeepSeek's own encoding_dsv4.py + encoding_dsv32.py on HuggingFace
+  // The model was trained on the EXACT template below (TOOLS_TEMPLATE from source).
+  //
+  // Critical: full-width pipe ｜ (U+FF5C) NOT ASCII pipe | (U+007C).
+  // The dsml_token = "｜DSML｜" in the source uses U+FF5C. Prompting with ASCII
+  // pipes means prompting the wrong token sequence — the primary cause of unreliable
+  // DSML output in prior iterations.
+  //
+  // Tool schemas are injected as JSON Schema (OpenAI format) — exactly what the
+  // official API passes to the model internally in the {tool_schemas} slot.
   if (tools.length > 0) {
-    // Build DSML tool definitions — mirrors what the paid API sends internally
-    const dsmlTools = tools.map((t: any) => {
+    // JSON Schema definitions — matches what the official DeepSeek API sends internally
+    const toolSchemas = tools.map((t: any) => {
       const fn = t.function || t;
-      const name = fn.name || "unknown";
-      const desc = fn.description || "";
-      const params = fn.parameters || fn.input_schema || {};
-      const required = params.required || [];
-      const props = Object.entries(params.properties || {}).map(([k, v]: [string, any]) => {
-        const type = v.type || "any";
-        const enumVals = v.enum ? ` (enum: ${v.enum.join(", ")})` : "";
-        const req = required.includes(k) ? " [required]" : "";
-        const propDesc = v.description ? ` — ${v.description}` : "";
-        return `  - ${k}: ${type}${enumVals}${req}${propDesc}`;
-      }).join("\n");
-      return `Tool: ${name}\n  Description: ${desc}\n  Parameters:\n${props || "    (none)"}`;
-    }).join("\n\n");
-
-    // Build concrete examples using the actual tool names from this request
-    const toolNames = tools.map((t: any) => (t.function || t).name).filter(Boolean);
-    const exName1 = toolNames[0] || "entity";
-    const exName2 = toolNames[1] || "knowledge";
+      return {
+        name: fn.name || "unknown",
+        description: fn.description || "",
+        parameters: fn.parameters || fn.input_schema || { type: "object", properties: {} },
+      };
+    });
 
     // tool_choice enforcement
     let choiceHint = "";
     if (toolChoice === "required" || toolChoice === "any") {
-      choiceHint = "\nYou MUST call at least one tool using the DSML format below.";
+      choiceHint = "\n\nYou MUST call at least one tool.";
     } else if (typeof toolChoice === "object" && toolChoice?.function?.name) {
-      choiceHint = `\nYou MUST call the tool "${toolChoice.function.name}" using the DSML format below.`;
+      choiceHint = `\n\nYou MUST call the tool "${toolChoice.function.name}".`;
     } else if (toolChoice === "none") {
-      choiceHint = "\nDo NOT call any tools. Respond with plain text only.";
+      choiceHint = "\n\nDo NOT call any tools. Respond with plain text only.";
     }
 
-    parts.push(`[AVAILABLE TOOLS]
-${dsmlTools}
+    // Official TOOLS_TEMPLATE from encoding_dsv4.py — verbatim, with full-width ｜
+    parts.push(
+      `## Tools\n\n` +
+      `You have access to a set of tools to help answer the user's question. ` +
+      `You can invoke tools by writing a "<｜DSML｜tool_calls>" block like the following as part of your reply. ` +
+      `You can use tools multiple times in a single reply.\n\n` +
+      `<｜DSML｜tool_calls>\n` +
+      `<｜DSML｜invoke name="$TOOL_NAME">\n` +
+      `<｜DSML｜parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜parameter>\n` +
+      `</｜DSML｜invoke>\n` +
+      `</｜DSML｜tool_calls>\n\n` +
+      `String parameters should be specified as is and set \`string="true"\`. ` +
+      `For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set \`string="false"\`.\n\n` +
+      `### Available Tool Schemas\n\n` +
+      `${JSON.stringify(toolSchemas, null, 2)}\n\n` +
+      `You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n\n` +
+      `After </｜DSML｜tool_calls> STOP immediately — no trailing text or explanation.\n\n` +
+      `CRITICAL DATA RULES:\n` +
+      `- Tool results are AUTHORITATIVE. NEVER fabricate, invent, or substitute names, IDs, counts, or any values.\n` +
+      `- If a tool returns N items, your response must reference exactly those N items verbatim.\n` +
+      `- If you need data, call a tool — NEVER guess or hallucinate.` +
+      `${choiceHint}`
+    );
 
-[TOOL CALL FORMAT — DSML]
-Use this exact format for ALL tool calls:
-
-Example A — single tool call:
-<|DSML|tool_calls>
-<|DSML|invoke name="${exName1}">
-<|DSML|parameter name="action" string="true">list<|DSML|parameter>
-<|DSML|parameter name="limit" string="false">10<|DSML|parameter>
-</|DSML|invoke>
-</|DSML|tool_calls>
-
-Example B — two independent tools in parallel (use when both are needed):
-<|DSML|tool_calls>
-<|DSML|invoke name="${exName1}">
-<|DSML|parameter name="action" string="true">get<|DSML|parameter>
-</|DSML|invoke>
-<|DSML|invoke name="${exName2}">
-<|DSML|parameter name="action" string="true">search<|DSML|parameter>
-</|DSML|invoke>
-</|DSML|tool_calls>
-
-Rules:
-- string="true" for string values, string="false" for numbers/booleans/objects/arrays (use JSON for non-strings)
-- All string values use CDATA if they contain special characters: <![CDATA[value with <tags> & symbols]]>
-- After the closing </|DSML|tool_calls> tag, STOP immediately — no trailing text, no explanation
-- Output </|DSML|tool_calls> after the final invoke, then stop
-
-CRITICAL DATA RULES:
-- Tool results are AUTHORITATIVE. NEVER fabricate, invent, or substitute names, IDs, counts, or any values.
-- If a tool returns 14 campaign names, present exactly those 14 names verbatim.
-- If you need data, call a tool — NEVER guess or hallucinate.
-- Never echo raw tool result JSON — present data naturally.${choiceHint}`);
-
-    console.log(`[ds-proxy] [${rid}] [openAIToDS] injected ${tools.length} DSML tool schemas, tool_choice=${typeof toolChoice === "object" ? JSON.stringify(toolChoice) : toolChoice || "auto"}`);
+    console.log(`[ds-proxy] [${rid}] [openAIToDS] injected ${tools.length} tool schemas (official DSML template, full-width ｜), tool_choice=${typeof toolChoice === "object" ? JSON.stringify(toolChoice) : toolChoice || "auto"}`);
   }
 
   // ── Messages ──────────────────────────────────────────────────────────────
@@ -964,7 +946,9 @@ CRITICAL DATA RULES:
     if (msg.role === "system") {
       if (text) { parts.push(`[SYSTEM]\n${text}`); systemCount++; }
     } else if (msg.role === "assistant") {
-      // Format previous tool calls in DSML so DeepSeek sees its own native format in context
+      // Reconstruct prior tool calls in official DSML format (full-width ｜, correct closing tags,
+      // EOS token) so the model sees its own training format in conversation history.
+      // Source: encoding_dsv4.py tool_calls_template + tool_call_template + p_dsml_template
       const toolCalls = (msg as any).tool_calls;
       if (toolCalls?.length) {
         const dsmlCalls = toolCalls.map((tc: any) => {
@@ -977,22 +961,27 @@ CRITICAL DATA RULES:
           } catch { argsObj = {}; }
           const params = Object.entries(argsObj).map(([k, v]) => {
             const isStr = typeof v === "string";
-            const val = isStr ? v : JSON.stringify(v);
-            return `<|DSML|parameter name="${k}" string="${isStr}">${val}<|DSML|parameter>`;
+            const val = isStr ? String(v) : JSON.stringify(v);
+            // Full-width ｜ (U+FF5C) + correct closing tag with slash — exact p_dsml_template
+            return `<｜DSML｜parameter name="${k}" string="${isStr}">${val}</｜DSML｜parameter>`;
           }).join("\n");
-          return `<|DSML|invoke name="${name}">\n${params}\n</|DSML|invoke>`;
+          return `<｜DSML｜invoke name="${name}">\n${params}\n</｜DSML｜invoke>`;
         }).join("\n");
-        parts.push(`[ASSISTANT]\n${text ? text + "\n" : ""}<|DSML|tool_calls>\n${dsmlCalls}\n</|DSML|tool_calls>`);
+        // EOS token appended immediately after closing tag — required by official encoding
+        // (encoding_dsv4.py: the turn ends with </｜DSML｜tool_calls><｜end▁of▁sentence｜>)
+        parts.push(`[ASSISTANT]\n${text ? text + "\n\n" : ""}<｜DSML｜tool_calls>\n${dsmlCalls}\n</｜DSML｜tool_calls><｜end▁of▁sentence｜>`);
         assistantCount++;
       } else if (text) {
         parts.push(`[ASSISTANT]\n${text}`);
         assistantCount++;
       }
     } else if (msg.role === "tool") {
-      // Tool results are AUTHORITATIVE data from the platform — label them clearly
-      // so DeepSeek treats them as ground truth, not optional context to hallucinate over.
+      // Official V4 format: <tool_result> tags inside the user turn
+      // Source: encoding_dsv4.py tool_output_template = "<tool_result>{content}</tool_result>"
+      // V3.2 used <result> tags — the parser handles both on output; we inject V4 format.
       const toolCallId = (msg as any).tool_call_id || "";
-      parts.push(`[TOOL RESULT${toolCallId ? ` id=${toolCallId}` : ""}]\nThe following is real data returned by the tool. Use ONLY this data in your response — do not invent, fabricate, or substitute any values:\n${text}`);
+      const resultAttr = toolCallId ? ` tool_call_id="${toolCallId}"` : "";
+      parts.push(`[USER]\n<tool_result${resultAttr}>\n${text}\n</tool_result>`);
       toolResultCount++;
     } else if (text) {
       parts.push(text);
@@ -1061,9 +1050,18 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
   const isInCodeBlock = (pos: number) => codeBlockRanges.some(([s, e]) => pos >= s && pos < e);
 
   // Pattern 0 (HIGHEST PRIORITY): DSML format — DeepSeek's native trained format
-  // Matches both full-width ｜ and ASCII | pipes
+  //
+  // Version differences (from official HuggingFace encoding files):
+  //   V4:   <｜DSML｜tool_calls>     ... <｜DSML｜invoke> ... <｜DSML｜parameter string="true|false">
+  //   V3.2: <｜DSML｜function_calls> ... same invoke/param format
+  //   Pre-DSML (R1/V3.1): <function_calls><invoke> without pipe characters (caught in P1)
+  //
+  // Parser matches both full-width ｜ (U+FF5C, trained format) and ASCII | (U+007C, fallback).
+  // The `string` attribute is required in V3.2+ — parser handles both with and without it.
+  // Outer block name (tool_calls vs function_calls) is ignored — we match invoke tags directly.
   const dsmlInvokeRegex = /<[｜|]?DSML[｜|]invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/[｜|]?DSML[｜|]invoke>/g;
-  const dsmlParamRegex = /<[｜|]?DSML[｜|]parameter\s+name="([^"]+)"\s+string="(true|false)"[^>]*>([\s\S]*?)<[\/]?[｜|]?DSML[｜|]parameter>/g;
+  // Matches both V3.2+ format (with string attr) and any parameter without the attr
+  const dsmlParamRegex = /<[｜|]?DSML[｜|]parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?[^>]*>([\s\S]*?)<[\/]?[｜|]?DSML[｜|]parameter>/g;
   let m;
   while ((m = dsmlInvokeRegex.exec(text)) !== null) {
     if (isInCodeBlock(m.index)) { console.log(`${tag} P0 DSML match skipped (inside code block)`); continue; }
@@ -1074,20 +1072,23 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
     dsmlParamRegex.lastIndex = 0;
     while ((pm = dsmlParamRegex.exec(paramsBlock)) !== null) {
       const paramName = pm[1];
-      const isString = pm[2] === "true";
+      const stringAttr = pm[2]; // "true" | "false" | undefined (pre-DSML models omit it)
       let rawVal = pm[3].trim();
       // Strip CDATA wrapper if present — model may wrap special chars in CDATA
       rawVal = rawVal.replace(/^<!\[CDATA\[([\s\S]*?)\]\]>$/, "$1").trim();
-      if (isString) {
+      // Strip EOS token if leaked into parameter value
+      rawVal = rawVal.replace(/<｜end▁of▁sentence｜>$/, "").trim();
+      if (stringAttr === "true" || (stringAttr === undefined && !/^[\[{]/.test(rawVal))) {
+        // string="true" explicitly, or no attr and value doesn't look like JSON
         params[paramName] = rawVal;
       } else {
-        // Apply JSON repairs before parsing — DeepSeek V4 emits invalid escapes and loose arrays
+        // string="false" (non-string) or value looks like JSON — parse it
         const repaired = repairLooseJsonArrays(repairInvalidBackslashes(rawVal));
         try { params[paramName] = JSON.parse(repaired); } catch { params[paramName] = rawVal; }
       }
     }
     calls.push({ name: toolName, input: params });
-    console.log(`${tag} P0 match (DSML native): ${toolName}(${JSON.stringify(params).slice(0, 150)})`);
+    console.log(`${tag} P0 match (DSML): ${toolName}(${JSON.stringify(params).slice(0, 150)})`);
   }
 
   // If DSML matched, skip other patterns — DSML is authoritative
@@ -1096,19 +1097,25 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
     return calls;
   }
 
-  // Log DSML near-miss for diagnostics
+  // Near-miss diagnostics — log what the model actually output when DSML didn't match
   if (text.length > 0) {
-    const hasDSML = /<[｜|]?DSML[｜|]/i.test(text);
-    if (hasDSML) {
-      console.warn(`${tag} ⚠ text contains DSML markers but parser didn't match. Preview: "${text.slice(0, 300).replace(/\n/g, "\\n")}"`);
+    const hasDSMLPipe = /<[｜|]?DSML[｜|]/i.test(text);
+    const hasInvoke = /<invoke\s+name=/i.test(text);
+    const hasFuncCalls = /<function_calls>/i.test(text);
+    const hasToolCalls = /<tool_calls>/i.test(text);
+    if (hasDSMLPipe || hasInvoke || hasFuncCalls || hasToolCalls) {
+      console.warn(`${tag} ⚠ tool-call markers found but parser didn't match (DSML=${hasDSMLPipe} invoke=${hasInvoke} func_calls=${hasFuncCalls} tool_calls=${hasToolCalls}). Preview: "${text.slice(0, 400).replace(/\n/g, "\\n")}"`);
     }
   }
 
-  // Pattern 1 (FALLBACK): Legacy XML format — DeepSeek V4 falls back to this at long context
-  // Format: <tool_calls><invoke name="tool_name"><parameter name="key">val</parameter></invoke></tool_calls>
-  // Confirmed in vLLM #36654, SGLang #14695, ds2api dual-parser implementation
+  // Pattern 1 (FALLBACK): Pre-DSML and V3.2 training-instability formats
+  // Three sub-patterns in descending specificity:
+  //   P1a: <function_calls><invoke name="..."> (V3.2 without DSML pipes — confirmed instability)
+  //   P1b: <tool_calls><invoke name="...">     (same but with tool_calls wrapper)
+  //   P1c: bare <invoke name="...">            (no outer wrapper — model omitted block entirely)
+  // All confirmed in: HuggingFace V3.2 discussions #29, sglang #14695, vLLM #30541
   const legacyInvokeRegex = /<invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/invoke>/g;
-  const legacyParamRegex = /<parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/parameter>/g;
+  const legacyParamRegex = /<parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?[^>]*>([\s\S]*?)<\/parameter>/g;
   let lm;
   while ((lm = legacyInvokeRegex.exec(text)) !== null) {
     if (isInCodeBlock(lm.index)) continue;
@@ -1119,10 +1126,14 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
     legacyParamRegex.lastIndex = 0;
     while ((pm2 = legacyParamRegex.exec(paramsBlock)) !== null) {
       const k = pm2[1];
-      let v = pm2[2].trim().replace(/^<!\[CDATA\[([\s\S]*?)\]\]>$/, "$1").trim();
-      // Try JSON parse, fall back to string
-      const repaired = repairLooseJsonArrays(repairInvalidBackslashes(v));
-      try { params[k] = JSON.parse(repaired); } catch { params[k] = v; }
+      const stringAttr = pm2[2]; // may be present in V3.2 fallback output
+      let v = pm2[3].trim().replace(/^<!\[CDATA\[([\s\S]*?)\]\]>$/, "$1").trim();
+      if (stringAttr === "true" || (stringAttr === undefined && !/^[\[{]/.test(v))) {
+        params[k] = v;
+      } else {
+        const repaired = repairLooseJsonArrays(repairInvalidBackslashes(v));
+        try { params[k] = JSON.parse(repaired); } catch { params[k] = v; }
+      }
     }
     calls.push({ name: toolName, input: params });
     console.log(`${tag} P1 match (legacy XML): ${toolName}(${JSON.stringify(params).slice(0, 150)})`);
@@ -1174,12 +1185,20 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
 
 function stripToolCallText(text: string): string {
   return text
-    // DSML format
+    // DSML V4: <｜DSML｜tool_calls>...</｜DSML｜tool_calls> (full-width or ASCII pipe)
     .replace(/<[｜|]?DSML[｜|]tool_calls>[\s\S]*?<\/[｜|]?DSML[｜|]tool_calls>/g, "")
+    // DSML V3.2: <｜DSML｜function_calls>...</｜DSML｜function_calls>
+    .replace(/<[｜|]?DSML[｜|]function_calls>[\s\S]*?<\/[｜|]?DSML[｜|]function_calls>/g, "")
+    // Orphaned DSML invoke blocks (outer wrapper stripped or missing)
     .replace(/<[｜|]?DSML[｜|]invoke[\s\S]*?<\/[｜|]?DSML[｜|]invoke>/g, "")
-    // Legacy XML format fallback
+    // Pre-DSML legacy: <function_calls>...</function_calls>
+    .replace(/<function_calls>[\s\S]*?<\/function_calls>/g, "")
+    // Legacy: <tool_calls>...</tool_calls>
     .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/g, "")
+    // Bare <invoke> without wrapper
     .replace(/<invoke[\s\S]*?<\/invoke>/g, "")
+    // EOS token that leaked into text
+    .replace(/<｜end▁of▁sentence｜>/g, "")
     // Bare JSON tool call pattern
     .replace(/\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/g, "")
     .trim();
