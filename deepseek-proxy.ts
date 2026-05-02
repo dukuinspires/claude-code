@@ -608,6 +608,198 @@ function dsHeaders(acc: PoolAccount, powResponse?: string | null): Record<string
   return h;
 }
 
+// ─── Context offload threshold ───────────────────────────────────────────────
+// When the estimated prompt exceeds this, serialize history to a file and
+// upload to DeepSeek's file API. Removes the lost-in-the-middle problem by
+// converting old context from inline tokens into a document the model reads.
+const CONTEXT_OFFLOAD_CHARS = 60_000;
+
+// ─── History transcript builder ───────────────────────────────────────────────
+// Mirrors ds2api's BuildOpenAICurrentInputContextTranscript format exactly.
+function buildHistoryTranscript(messages: any[]): string {
+  const lines: string[] = [
+    "# DS2API_HISTORY.txt",
+    "Prior conversation history and tool progress.",
+    "",
+  ];
+  let n = 0;
+  for (const msg of messages) {
+    const text = typeof msg.content === "string"
+      ? msg.content
+      : Array.isArray(msg.content)
+        ? msg.content.map((b: any) => b.text || "").join("")
+        : "";
+    const hasToolCalls = (msg.tool_calls?.length ?? 0) > 0;
+    if (!text && !hasToolCalls) continue;
+    n++;
+    const role = (msg.role || "user").toUpperCase().replace("FUNCTION", "TOOL");
+    lines.push(`=== ${n}. ${role} ===`);
+    if (msg.role === "tool") {
+      const toolCallId = (msg as any).tool_call_id || "";
+      const toolName = (msg as any).name || "";
+      lines.push(`[name=${toolName} tool_call_id=${toolCallId}]`);
+    }
+    if (hasToolCalls) {
+      for (const tc of msg.tool_calls) {
+        const name = tc.function?.name || tc.name || "unknown";
+        const args = tc.function?.arguments || "{}";
+        lines.push(`[tool_call: ${name}(${args})]`);
+      }
+    }
+    if (text) lines.push(text);
+    lines.push("");
+  }
+  return lines.join("\n").trimEnd() + "\n";
+}
+
+// ─── DeepSeek file upload + poll ─────────────────────────────────────────────
+const FILE_READY_STATUSES = new Set(["processed","ready","done","available","success","completed","finished"]);
+
+async function uploadHistoryFile(
+  acc: PoolAccount,
+  transcript: string,
+  modelType: string,
+  rid: string
+): Promise<string | null> {
+  const pow = await getPowResponse("/api/v0/file/upload_file", acc.token);
+  if (!pow) {
+    console.warn(`[ds-proxy] [${rid}] [file-upload] ⚠ PoW failed — skipping file offload`);
+    return null;
+  }
+
+  const fileBytes = new TextEncoder().encode(transcript);
+  const boundary = `----FormBoundary${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+  const enc2 = new TextEncoder();
+  const headerPart = enc2.encode(
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="file"; filename="DS2API_HISTORY.txt"\r\n` +
+    `Content-Type: text/plain; charset=utf-8\r\n\r\n`
+  );
+  const footerPart = enc2.encode(`\r\n--${boundary}--\r\n`);
+  const bodyBuf = new Uint8Array(headerPart.length + fileBytes.length + footerPart.length);
+  bodyBuf.set(headerPart, 0);
+  bodyBuf.set(fileBytes, headerPart.length);
+  bodyBuf.set(footerPart, headerPart.length + fileBytes.length);
+
+  const t0 = Date.now();
+  console.log(`[ds-proxy] [${rid}] [file-upload] uploading ${transcript.length} char history (${fileBytes.length} bytes)`);
+  try {
+    const res = await fetch(`${DS_API}/api/v0/file/upload_file`, {
+      method: "POST",
+      headers: {
+        "authorization": `Bearer ${acc.token}`,
+        "content-type": `multipart/form-data; boundary=${boundary}`,
+        "x-app-version": "20241129.1",
+        "x-client-platform": "web",
+        "x-client-version": "1.8.0",
+        "x-model-type": modelType,
+        "x-ds-pow-response": pow,
+        "x-file-size": String(fileBytes.length),
+        "x-thinking-enabled": "1",
+        "referer": "https://chat.deepseek.com/",
+        "origin": "https://chat.deepseek.com",
+        "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36",
+      },
+      body: bodyBuf,
+    });
+    const data = await res.json() as any;
+    const fileId: string | undefined =
+      data?.data?.biz_data?.file?.id ||
+      data?.data?.biz_data?.id ||
+      data?.data?.file?.id ||
+      data?.file_id;
+
+    if (!fileId) {
+      console.warn(`[ds-proxy] [${rid}] [file-upload] ⚠ no file ID — HTTP ${res.status}: ${JSON.stringify(data).slice(0, 300)}`);
+      return null;
+    }
+    console.log(`[ds-proxy] [${rid}] [file-upload] ✓ uploaded fileId=${fileId} (${Date.now() - t0}ms) — polling for ready`);
+
+    // Poll until the file is processed (max 30s)
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      try {
+        const pollRes = await fetch(`${DS_API}/api/v0/file/fetch_files?file_ids=${fileId}`, {
+          headers: {
+            "authorization": `Bearer ${acc.token}`,
+            "x-app-version": "20241129.1",
+            "x-client-platform": "web",
+            "x-client-version": "1.8.0",
+          },
+        });
+        const pollData = await pollRes.json() as any;
+        const files: any[] =
+          pollData?.data?.biz_data?.files ||
+          pollData?.data?.files ||
+          [];
+        const file = files.find((f: any) => f.id === fileId || f.file_id === fileId);
+        const status = (file?.status || "").toLowerCase();
+        if (FILE_READY_STATUSES.has(status)) {
+          console.log(`[ds-proxy] [${rid}] [file-upload] ✓ ready (status=${status}) in ${Date.now() - t0}ms`);
+          return fileId;
+        }
+        if (i % 5 === 0) console.log(`[ds-proxy] [${rid}] [file-upload] polling... status=${status || "unknown"} (${i + 1}/30)`);
+      } catch (pe: any) {
+        console.warn(`[ds-proxy] [${rid}] [file-upload] poll error: ${pe.message}`);
+      }
+    }
+    console.warn(`[ds-proxy] [${rid}] [file-upload] ⚠ not ready after 30s — falling back to inline`);
+    return null;
+  } catch (e: any) {
+    console.error(`[ds-proxy] [${rid}] [file-upload] ✗ upload threw: ${e.message}`);
+    return null;
+  }
+}
+
+// ─── V4 auto-continue ─────────────────────────────────────────────────────────
+// DeepSeek V4 signals INCOMPLETE when a response is cut short. We call
+// /api/v0/chat/continue to resume — up to 8 rounds (ds2api defaultAutoContinueLimit).
+async function autoContinue(
+  acc: PoolAccount,
+  sessionId: string,
+  messageId: number,
+  pow: string | null,
+  rid: string
+): Promise<string> {
+  console.log(`[ds-proxy] [${rid}] [v4-continue] calling /api/v0/chat/continue (msgId=${messageId})`);
+  try {
+    const res = await fetch(`${DS_API}/api/v0/chat/continue`, {
+      method: "POST",
+      headers: dsHeaders(acc, pow),
+      body: JSON.stringify({
+        chat_session_id: sessionId,
+        message_id: messageId,
+        fallback_to_resume: true,
+      }),
+    });
+    let continuedText = "";
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        try {
+          const event = JSON.parse(data);
+          if (event.v && typeof event.v === "string") continuedText += event.v;
+          else if (event.v?.content && typeof event.v.content === "string") continuedText += event.v.content;
+        } catch { /* skip */ }
+      }
+    }
+    console.log(`[ds-proxy] [${rid}] [v4-continue] ✓ got ${continuedText.length} continuation chars`);
+    return continuedText;
+  } catch (e: any) {
+    console.warn(`[ds-proxy] [${rid}] [v4-continue] ✗ continue failed: ${e.message}`);
+    return "";
+  }
+}
+
 // ─── JSON repair helpers ──────────────────────────────────────────────────────
 // DeepSeek V4 frequently emits invalid JSON in tool call parameters.
 // These two repairs (from ds2api + NIyueeE research) catch the most common patterns.
@@ -630,7 +822,7 @@ function repairLooseJsonArrays(text: string): string {
 }
 
 // ─── OpenAI → DeepSeek body ───────────────────────────────────────────────────
-function openAIToDS(body: any, sessionId: string) {
+function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
   const messages: any[] = body.messages || [];
   const tools = body.tools || [];
   const toolChoice = body.tool_choice;
@@ -728,7 +920,32 @@ CRITICAL DATA RULES:
   }
 
   // ── Messages ──────────────────────────────────────────────────────────────
+  // When history was offloaded to a file, replace all messages with a single
+  // continuation instruction. The model reads the file as a document and picks
+  // up exactly where the conversation left off.
   let systemCount = 0, assistantCount = 0, toolResultCount = 0, userCount = 0;
+
+  if (offloadedFileId) {
+    // History is in the file — inject a single continuation prompt
+    parts.push(
+      `[USER]\n` +
+      `Continue from the latest state in the attached DS2API_HISTORY.txt context. ` +
+      `Treat it as the current working state and answer the latest user request directly. ` +
+      `Use ONLY data from the tool results in the attached history — do not fabricate any values.`
+    );
+    userCount++;
+    const prompt = parts.join("\n\n");
+    console.log(`[ds-proxy] [${rid}] [openAIToDS] file-offload mode — prompt=${prompt.length} chars (history in file ${offloadedFileId})`);
+    return {
+      chat_session_id: sessionId,
+      parent_message_id: null,
+      prompt,
+      ref_file_ids: [offloadedFileId],
+      thinking_enabled: !!body.thinking_enabled,
+      search_enabled: !!body.search_enabled,
+      model_type: body.model_type || "expert",
+    };
+  }
 
   for (const msg of messages) {
     const text = typeof msg.content === "string"
@@ -968,13 +1185,45 @@ async function doCompletion(body: any, acc: PoolAccount, rid: string) {
   }
   console.log(`[ds-proxy] [completion] [${rid}] session=${sessionId} (${Date.now() - t0}ms)`);
 
+  // ── Context offload check ────────────────────────────────────────────────
+  // Estimate the inline prompt size. If it would exceed the threshold, upload
+  // the conversation history as a file — this removes the lost-in-the-middle
+  // problem by converting buried context into a document DeepSeek reads cleanly.
+  let offloadedFileId: string | undefined;
+  const messages: any[] = body.messages || [];
+  const tools: any[] = body.tools || [];
+  const modelType: string = body.model_type || "expert";
+
+  if (tools.length > 0 && messages.length > 2) {
+    // Quick size estimate: sum of all message content + rough tool schema estimate
+    const msgChars = messages.reduce((sum, m) => {
+      const text = typeof m.content === "string" ? m.content.length
+        : Array.isArray(m.content) ? m.content.reduce((s: number, b: any) => s + (b.text?.length || 0), 0)
+        : 0;
+      return sum + text;
+    }, 0);
+    const toolChars = tools.reduce((sum, t) => sum + JSON.stringify(t).length, 0);
+    const estimatedSize = msgChars + toolChars;
+
+    if (estimatedSize > CONTEXT_OFFLOAD_CHARS) {
+      console.log(`[ds-proxy] [${rid}] [context-offload] estimated ${estimatedSize} chars > ${CONTEXT_OFFLOAD_CHARS} threshold — uploading history`);
+      const transcript = buildHistoryTranscript(messages);
+      offloadedFileId = await uploadHistoryFile(acc, transcript, modelType, rid) || undefined;
+      if (offloadedFileId) {
+        console.log(`[ds-proxy] [${rid}] [context-offload] ✓ history offloaded to ${offloadedFileId} — inline prompt will be minimal`);
+      } else {
+        console.warn(`[ds-proxy] [${rid}] [context-offload] ⚠ upload failed — falling back to inline (hallucination risk at ${estimatedSize} chars)`);
+      }
+    }
+  }
+
   const pow = await getPowResponse("/api/v0/chat/completion", acc.token);
   console.log(`[ds-proxy] [completion] [${rid}] PoW=${pow ? "solved" : "skipped"} — calling /chat/completion`);
 
   const upstream = await fetch(`${DS_API}/api/v0/chat/completion`, {
     method: "POST",
     headers: dsHeaders(acc, pow),
-    body: JSON.stringify(openAIToDS({ ...body, _rid: rid }, sessionId)),
+    body: JSON.stringify(openAIToDS({ ...body, _rid: rid }, sessionId, offloadedFileId)),
   });
   console.log(`[ds-proxy] [completion] [${rid}] upstream HTTP ${upstream.status} (${Date.now() - t0}ms total)`);
 
@@ -1440,6 +1689,7 @@ Bun.serve({
       let upstream: Response | null = null;
       let usedAcc: PoolAccount | null = null;
       let sessionId = "";
+      let usedPow: string | null = null;
       let lastErrText = "";
       const tried = new Set<PoolAccount>();
       let attempt = 0;
@@ -1482,6 +1732,7 @@ Bun.serve({
           upstream = result.upstream;
           usedAcc = acc;
           sessionId = result.sessionId;
+          usedPow = result.pow;
           break;
         } catch (err: any) {
           console.error(`[ds-proxy] [${rid}] ✗ doCompletion threw (${acc.email}): ${err.message}`);
@@ -1507,6 +1758,7 @@ Bun.serve({
         // DeepSeek V4 can signal mid-stream that the response is incomplete and needs
         // a continuation request. Without this, responses silently truncate.
         let needsContinuation = false;
+        let responseMessageId: number | null = null;
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -1524,6 +1776,9 @@ Bun.serve({
                 console.log(`[ds-proxy] [${rid}] [v4-continue] continuation signal detected — will re-request`);
                 needsContinuation = true;
               }
+              // Capture response message ID — needed for /api/v0/chat/continue call
+              if (typeof event.message_id === "number") responseMessageId = event.message_id;
+              else if (typeof event.id === "number") responseMessageId = event.id;
               if (event.v && typeof event.v === "string") {
                 // Capture both bare text chunks AND APPEND events (which have event.p set)
                 fullText += event.v;
@@ -1550,8 +1805,29 @@ Bun.serve({
             } catch { /* skip */ }
           }
         }
+        // V4 auto-continue loop — up to 8 rounds (mirrors ds2api defaultAutoContinueLimit)
+        // When DeepSeek V4 signals INCOMPLETE, call /api/v0/chat/continue to resume.
         if (needsContinuation) {
-          console.log(`[ds-proxy] [${rid}] [v4-continue] response was INCOMPLETE (${fullText.length} chars so far) — continuation not yet implemented, returning partial`);
+          if (responseMessageId !== null) {
+            console.log(`[ds-proxy] [${rid}] [v4-continue] response INCOMPLETE (${fullText.length} chars) — starting continuation loop (msgId=${responseMessageId})`);
+            // Re-use the original PoW or get a fresh one for the continue endpoint
+            const continuePoW = await getPowResponse("/api/v0/chat/continue", usedAcc!.token);
+            for (let round = 1; round <= 8; round++) {
+              const continuation = await autoContinue(usedAcc!, sessionId, responseMessageId, continuePoW, rid);
+              if (continuation.length > 0) {
+                fullText += continuation;
+                console.log(`[ds-proxy] [${rid}] [v4-continue] round ${round} — appended ${continuation.length} chars (total=${fullText.length})`);
+                // autoContinue streams its own response; if it returns text, assume complete.
+                // Future: parse continuation SSE for another INCOMPLETE signal to chain further rounds.
+                break;
+              } else {
+                console.log(`[ds-proxy] [${rid}] [v4-continue] round ${round} — empty continuation, stopping`);
+                break;
+              }
+            }
+          } else {
+            console.warn(`[ds-proxy] [${rid}] [v4-continue] ⚠ INCOMPLETE but no message_id in SSE events — returning partial (${fullText.length} chars)`);
+          }
         }
 
         const totalMs = Date.now() - t0;
