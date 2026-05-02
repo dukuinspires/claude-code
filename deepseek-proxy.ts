@@ -254,6 +254,9 @@ console.log(`[ds-proxy] [init] post-init pool — size=${envPoolSize} from env`)
 console.log("[ds-proxy] [init] triggering SmartAssist auto-sync to load all DB accounts");
 syncPoolFromSmartAssist();
 
+// Periodic sync handled by SmartAssist Cloud Tasks cron job (ds-proxy-sync every 15min).
+// No setInterval needed — SmartAssist pushes tokens to the proxy on schedule.
+
 /** Prune old timestamps and return current request count in the sliding window */
 function windowCount(acc: PoolAccount): number {
   const cutoff = Date.now() - THROTTLE_WINDOW_MS;
