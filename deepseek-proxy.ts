@@ -62,9 +62,19 @@ async function getSmartAssistIdToken(): Promise<string | null> {
 
 // ─── Account pool ─────────────────────────────────────────────────────────────
 
-// Proactive throttle: max requests per account in a sliding window
+// ─── Rate limit intelligence (empirical data from 165K request analysis) ──────
+// DeepSeek throttles at ~18 req/min sustained per account. Progressive tightening:
+// first offence gets 19min, repeat offenders get <1min before re-block.
+// Soft throttle signal: chars=0 responses (HTTP 200 but empty content).
+// Token is never revoked — only throttled. Full reset after traffic normalises.
 const THROTTLE_WINDOW_MS = 60_000;  // 1 minute window
-const THROTTLE_MAX_REQ   = 10;      // max requests per account per window
+const THROTTLE_MAX_REQ   = 16;     // conservative: 16 req/min (under 18 limit)
+
+// Progressive cooldown: increases with consecutive failures to match DeepSeek's
+// cumulative memory. Fixed 10min was too short — DeepSeek remembers repeat offenders.
+const COOLDOWN_BASE_MS   = 10 * 60 * 1000;  // 10 minutes (first failure)
+const COOLDOWN_MAX_MS    = 60 * 60 * 1000;  // 60 minutes (max)
+const COOLDOWN_MULTIPLIER = 1.5;             // each failure: 10 → 15 → 22 → 34 → 50 → 60 min
 
 interface PoolAccount {
   token: string;
@@ -80,6 +90,11 @@ interface PoolAccount {
   recentRequests: number[];
   // Token lifecycle tracking — learn actual TTL from 40003 expiry events
   tokenObtainedAt?: number;
+  // Rate limit detection: consecutive empty responses (chars=0)
+  consecutiveEmpties: number;
+  // Total successful responses with content (for stats)
+  totalWithContent: number;
+  totalEmpty: number;
 }
 
 // ─── Token lifetime tracking ─────────────────────────────────────────────────
@@ -140,6 +155,9 @@ function initPoolFromEnv() {
         lastUsed: 0,
         recentRequests: [],
         tokenObtainedAt: a.token_obtained_at ? new Date(a.token_obtained_at).getTime() : Date.now(),
+        consecutiveEmpties: 0,
+        totalWithContent: 0,
+        totalEmpty: 0,
       }));
       const active = pool.filter(a => a.status === "active").length;
       console.log(`[ds-proxy] [init] ✓ Loaded ${pool.length} account(s) from DS_POOL_JSON (${active} active)`);
@@ -165,6 +183,9 @@ function initPoolFromEnv() {
       failureCount: 0,
       lastUsed: 0,
       recentRequests: [],
+      consecutiveEmpties: 0,
+      totalWithContent: 0,
+      totalEmpty: 0,
     }];
     console.log(`[ds-proxy] [init] ✓ Loaded 1 account from DS_USER_TOKEN (email=${process.env.DS_EMAIL || "unknown"})`);
   } else {
@@ -224,15 +245,14 @@ async function syncPoolFromSmartAssist() {
   }
 }
 
-// Bootstrap: sync from SmartAssist if pool is empty after env init
-const poolIsEmpty = pool.length === 0 || pool.every(a => !a.token);
-console.log(`[ds-proxy] [init] post-init pool — size=${pool.length} empty=${poolIsEmpty}`);
-if (poolIsEmpty) {
-  console.log("[ds-proxy] [init] pool empty — triggering SmartAssist auto-sync");
-  syncPoolFromSmartAssist();
-} else {
-  console.log(`[ds-proxy] [init] pool has ${pool.length} account(s) — skipping auto-sync`);
-}
+// Bootstrap: ALWAYS sync from SmartAssist on startup to pick up all accounts.
+// Even if DS_USER_TOKEN provides 1 account, the DB may have more (e.g. 3-4 accounts
+// registered via OAuth). The sync merges DB accounts into the pool without dropping
+// any that were loaded from env vars.
+const envPoolSize = pool.length;
+console.log(`[ds-proxy] [init] post-init pool — size=${envPoolSize} from env`);
+console.log("[ds-proxy] [init] triggering SmartAssist auto-sync to load all DB accounts");
+syncPoolFromSmartAssist();
 
 /** Prune old timestamps and return current request count in the sliding window */
 function windowCount(acc: PoolAccount): number {
@@ -255,6 +275,7 @@ function pickAccount(): PoolAccount | null {
     if (acc.status === "cooling" && acc.coolingUntil && now >= acc.coolingUntil) {
       acc.status = "active";
       acc.coolingUntil = undefined;
+      acc.consecutiveEmpties = 0; // Reset empty counter on thaw
       console.log(`[ds-proxy] [pool] ♻ Thawed ${acc.email || "??"} back to active (failures=${acc.failureCount})`);
     }
   }
@@ -262,16 +283,17 @@ function pickAccount(): PoolAccount | null {
   // Active accounts that are under the proactive throttle threshold
   const actives = pool.filter(a => a.status === "active" && a.token && windowCount(a) < THROTTLE_MAX_REQ);
   if (!actives.length) {
-    // All active accounts are throttled — fall back to least-loaded even if over threshold
+    // All active accounts are at the throttle limit — DO NOT exceed.
+    // Exceeding triggers DeepSeek's progressive tightening which makes things worse.
+    // Return null so the caller gets a 503 and runLLM falls back to another provider.
     const anyActive = pool.filter(a => a.status === "active" && a.token);
     if (!anyActive.length) {
       const s = poolSummary();
       console.warn(`[ds-proxy] [pool] ✗ no active accounts — total=${s.total} cooling=${s.cooling} dead=${s.dead}`);
-      return null;
+    } else {
+      console.warn(`[ds-proxy] [pool] ⚠ all ${anyActive.length} account(s) at throttle limit (${THROTTLE_MAX_REQ} req/min) — returning 503 to trigger fallback`);
     }
-    anyActive.sort((a, b) => windowCount(a) - windowCount(b));
-    console.warn(`[ds-proxy] [pool] ⚠ all accounts at throttle limit — using least-loaded: ${anyActive[0].email || "??"} (${windowCount(anyActive[0])} req/min)`);
-    return anyActive[0];
+    return null;
   }
 
   // Prefer least-recently-used among unthrottled accounts
@@ -279,22 +301,34 @@ function pickAccount(): PoolAccount | null {
   return actives[0];
 }
 
-/** Mark an account as cooling (token expired). Cool for 10 minutes then retry. */
+/** Mark an account as cooling (rate-limited). Progressive cooldown to match
+ *  DeepSeek's cumulative memory. Does NOT trigger re-login (rate limit = same
+ *  token is fine, just needs rest). */
 function coolAccount(acc: PoolAccount) {
-  recordTokenExpiry(acc); // Track how long the token lasted
   acc.status = "cooling";
   acc.failureCount++;
-  acc.coolingUntil = Date.now() + 10 * 60 * 1000;
+  // Progressive cooldown: 10 → 15 → 22 → 34 → 50 → 60 min (capped)
+  const cooldownMs = Math.min(
+    COOLDOWN_BASE_MS * Math.pow(COOLDOWN_MULTIPLIER, acc.failureCount - 1),
+    COOLDOWN_MAX_MS
+  );
+  acc.coolingUntil = Date.now() + cooldownMs;
+  const cooldownMin = (cooldownMs / 60_000).toFixed(0);
   const s = poolSummary();
   const ageH = acc.tokenObtainedAt ? ((Date.now() - acc.tokenObtainedAt) / 3_600_000).toFixed(1) + "h" : "?";
-  console.log(`[ds-proxy] [pool] ❄ Cooled ${acc.email || "??"} for 10min (failures=${acc.failureCount} tokenAge=${ageH}) — pool: active=${s.active} cooling=${s.cooling} dead=${s.dead}`);
+  console.log(`[ds-proxy] [pool] ❄ Cooled ${acc.email || "??"} for ${cooldownMin}min (failures=${acc.failureCount} tokenAge=${ageH} empties=${acc.consecutiveEmpties}) — pool: active=${s.active} cooling=${s.cooling} dead=${s.dead}`);
+}
 
-  // Trigger background re-login if credentials available
-  if (acc.email && acc.password) {
-    console.log(`[ds-proxy] [pool] → triggering background re-login for ${acc.email}`);
+/** Mark an account as expired (40003 token invalid). Triggers re-login to get a fresh token. */
+function expireAccount(acc: PoolAccount) {
+  recordTokenExpiry(acc);
+  coolAccount(acc);
+  // Trigger background re-login — VPS OAuth doesn't need a password
+  if (acc.email) {
+    console.log(`[ds-proxy] [pool] → triggering background re-login for ${acc.email} (hasPassword=${!!acc.password})`);
     reloginAccount(acc).catch(() => {});
   } else {
-    console.warn(`[ds-proxy] [pool] ⚠ ${acc.email || "??"} has no stored password — cannot auto re-login`);
+    console.warn(`[ds-proxy] [pool] ⚠ account has no email — cannot auto re-login`);
   }
 }
 
@@ -368,11 +402,57 @@ async function loginDeepSeek(email: string, password: string, deviceId?: string)
   }
 }
 
+/** Try VPS OAuth relogin first (same flow that registered accounts successfully).
+ *  Falls back to password login if VPS OAuth is unavailable. */
+async function reloginViaVpsOAuth(email: string): Promise<string | null> {
+  const vpsUrl = process.env.VPS_PROXY_URL;
+  const vpsSecret = process.env.SMTP_PROXY_SECRET;
+  if (!vpsUrl || !vpsSecret) {
+    console.log(`[ds-proxy] [relogin-oauth] VPS_PROXY_URL or SMTP_PROXY_SECRET not set — skipping OAuth path`);
+    return null;
+  }
+  const oauthUrl = `${vpsUrl}/ds-oauth/register`;
+  console.log(`[ds-proxy] [relogin-oauth] calling VPS OAuth for ${email}: ${oauthUrl}`);
+  try {
+    const t0 = Date.now();
+    const res = await fetch(oauthUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-smtp-proxy-secret": vpsSecret,
+      },
+      body: JSON.stringify({ email, mode: "relogin" }),
+      signal: AbortSignal.timeout(120_000), // VPS OAuth can take up to 60s
+    });
+    const elapsed = Date.now() - t0;
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.warn(`[ds-proxy] [relogin-oauth] VPS HTTP ${res.status} in ${elapsed}ms — ${body.slice(0, 200)}`);
+      return null;
+    }
+    const data = await res.json() as any;
+    const token = data?.token || data?.data?.token;
+    console.log(`[ds-proxy] [relogin-oauth] ${token ? "✓" : "✗"} VPS OAuth ${token ? "succeeded" : "failed"} for ${email} in ${elapsed}ms`);
+    return token || null;
+  } catch (e: any) {
+    console.error(`[ds-proxy] [relogin-oauth] ✗ VPS OAuth threw for ${email}: ${e.message}`);
+    return null;
+  }
+}
+
 async function reloginAccount(acc: PoolAccount) {
-  if (!acc.email || !acc.password) return;
+  if (!acc.email) return;
   console.log(`[ds-proxy] [relogin] 🔑 re-logging in ${acc.email} (failures=${acc.failureCount})`);
   const t0 = Date.now();
-  const newToken = await loginDeepSeek(acc.email, acc.password);
+
+  // Try VPS OAuth first (same flow that successfully registered accounts)
+  let newToken = await reloginViaVpsOAuth(acc.email);
+
+  // Fallback: password login via VPS (may get RISK_DEVICE_DETECTED)
+  if (!newToken && acc.password) {
+    console.log(`[ds-proxy] [relogin] VPS OAuth failed — trying password login for ${acc.email}`);
+    newToken = await loginDeepSeek(acc.email, acc.password);
+  }
   const elapsed = Date.now() - t0;
 
   if (newToken) {
@@ -381,6 +461,9 @@ async function reloginAccount(acc: PoolAccount) {
     acc.failureCount = 0;
     acc.coolingUntil = undefined;
     acc.tokenObtainedAt = Date.now();
+    acc.consecutiveEmpties = 0;
+    acc.totalWithContent = 0;
+    acc.totalEmpty = 0;
     console.log(`[ds-proxy] [relogin] ✓ re-login succeeded for ${acc.email} in ${elapsed}ms`);
 
     // Persist back to SmartAssist
@@ -512,14 +595,34 @@ function dsHeaders(acc: PoolAccount, powResponse?: string | null): Record<string
 
 // ─── OpenAI → DeepSeek body ───────────────────────────────────────────────────
 function openAIToDS(body: any, sessionId: string) {
-  const messages = body.messages || [];
-  const lastUser = [...messages].reverse().find((m: any) => m.role === "user");
-  const prompt = typeof lastUser?.content === "string"
-    ? lastUser.content
-    : Array.isArray(lastUser?.content)
-      ? lastUser.content.map((b: any) => b.text || "").join("")
-      : "";
-  return { chat_session_id: sessionId, parent_message_id: null, prompt, ref_file_ids: [], thinking_enabled: false, search_enabled: false };
+  const messages: any[] = body.messages || [];
+  const parts: string[] = [];
+
+  // Prepend JSON enforcement instruction before context if requested
+  if (body.response_format?.type === "json_object") {
+    parts.push("IMPORTANT: Respond with ONLY a raw JSON object. No markdown code fences. No preamble. Start with { and end with }.");
+  }
+
+  for (const msg of messages) {
+    const text = typeof msg.content === "string"
+      ? msg.content
+      : Array.isArray(msg.content)
+        ? msg.content.map((b: any) => b.text || "").join("")
+        : "";
+    if (!text) continue;
+    if (msg.role === "system") parts.push(`[SYSTEM]\n${text}`);
+    else if (msg.role === "assistant") parts.push(`[ASSISTANT]\n${text}`);
+    else parts.push(text);
+  }
+
+  return {
+    chat_session_id: sessionId,
+    parent_message_id: null,
+    prompt: parts.join("\n\n"),
+    ref_file_ids: [],
+    thinking_enabled: false,
+    search_enabled: !!body.search_enabled,
+  };
 }
 
 // ─── Check for expired-token error code ──────────────────────────────────────
@@ -642,6 +745,9 @@ Bun.serve({
         failureCount: 0,
         lastUsed: 0,
         recentRequests: [],
+        consecutiveEmpties: 0,
+        totalWithContent: 0,
+        totalEmpty: 0,
       }));
       if (!accounts.length) return Response.json({ error: "accounts array required" }, { status: 400 });
       const prev = poolSummary();
@@ -669,11 +775,14 @@ Bun.serve({
         existing.failureCount = 0;
         existing.coolingUntil = undefined;
         existing.tokenObtainedAt = Date.now();
+        existing.consecutiveEmpties = 0;
+        existing.totalWithContent = 0;
+        existing.totalEmpty = 0;
         if (body.dliq || body.hifDliq) existing.dliq = body.dliq || body.hifDliq;
         if (body.leim || body.hifLeim) existing.leim = body.leim || body.hifLeim;
         console.log(`[ds-proxy] [${rid}] 🔄 token updated for existing account ${body.email || "unknown"}`);
       } else {
-        pool.push({ token: body.token, email: body.email, dliq: body.dliq, leim: body.leim, status: "active", failureCount: 0, lastUsed: 0, recentRequests: [], tokenObtainedAt: Date.now() });
+        pool.push({ token: body.token, email: body.email, dliq: body.dliq, leim: body.leim, status: "active", failureCount: 0, lastUsed: 0, recentRequests: [], tokenObtainedAt: Date.now(), consecutiveEmpties: 0, totalWithContent: 0, totalEmpty: 0 });
         console.log(`[ds-proxy] [${rid}] 🔄 new account added to pool: ${body.email || "unknown"} (pool size now ${pool.length})`);
       }
       return Response.json({ ok: true, poolSize: pool.length });
@@ -713,7 +822,14 @@ Bun.serve({
           tokenAgeHours: a.tokenObtainedAt ? +((Date.now() - a.tokenObtainedAt) / 3_600_000).toFixed(1) : null,
           lastUsed: a.lastUsed ? new Date(a.lastUsed).toISOString() : null,
           coolingUntil: a.coolingUntil ? new Date(a.coolingUntil).toISOString() : null,
+          cooldownMin: a.coolingUntil ? +((a.coolingUntil - Date.now()) / 60_000).toFixed(1) : null,
           reqInWindow: windowCount(a),
+          consecutiveEmpties: a.consecutiveEmpties,
+          totalWithContent: a.totalWithContent,
+          totalEmpty: a.totalEmpty,
+          hitRate: a.totalWithContent + a.totalEmpty > 0
+            ? +((a.totalWithContent / (a.totalWithContent + a.totalEmpty)) * 100).toFixed(1)
+            : null,
         })),
       });
     }
@@ -770,14 +886,13 @@ Bun.serve({
             const { expired, text } = await isExpiredToken(result.upstream);
             lastErrText = text;
             if (expired) {
-              console.warn(`[ds-proxy] [${rid}] ⚠ 40003 (token expired) on ${acc.email || "??"} — cooling, trying next`);
-              coolAccount(acc);
+              console.warn(`[ds-proxy] [${rid}] ⚠ 40003 (token expired) on ${acc.email || "??"} — expiring, trying next`);
+              expireAccount(acc);
               continue;
             }
             if (result.upstream.status === 429) {
-              console.warn(`[ds-proxy] [${rid}] ⚠ 429 (rate limit) on ${acc.email || "??"} — soft cooling 2min, trying next`);
-              acc.status = "cooling";
-              acc.coolingUntil = Date.now() + 2 * 60 * 1000;
+              console.warn(`[ds-proxy] [${rid}] ⚠ 429 (rate limit) on ${acc.email || "??"} — cooling, trying next`);
+              coolAccount(acc); // progressive cooldown handles the timing
               continue;
             }
             console.error(`[ds-proxy] [${rid}] ✗ upstream HTTP ${result.upstream.status} on ${acc.email}: ${text.slice(0, 200)}`);
@@ -845,6 +960,21 @@ Bun.serve({
             }
 
             const totalMs = Date.now() - t0;
+            // Track empty responses — soft throttle detection
+            if (fullText.length === 0) {
+              usedAcc!.consecutiveEmpties++;
+              usedAcc!.totalEmpty++;
+              if (usedAcc!.consecutiveEmpties >= 3) {
+                console.warn(`[ds-proxy] [${rid}] ⚠ ${usedAcc!.consecutiveEmpties} consecutive empty streams — proactive cooling ${usedAcc!.email || "??"}`);
+                coolAccount(usedAcc!);
+              }
+            } else {
+              usedAcc!.consecutiveEmpties = 0;
+              usedAcc!.totalWithContent++;
+              if (usedAcc!.totalWithContent % 5 === 0 && usedAcc!.failureCount > 0) {
+                usedAcc!.failureCount = Math.max(0, usedAcc!.failureCount - 1);
+              }
+            }
             console.log(`[ds-proxy] [${rid}] ✓ stream done — account=${usedAcc!.email || "??"} chars=${fullText.length} chunks=${chunkCount} totalMs=${totalMs}`);
             controller.close();
           },
@@ -871,6 +1001,23 @@ Bun.serve({
       }
 
       const totalMs = Date.now() - t0;
+      // Track empty responses (chars=0) — early warning of DeepSeek throttling
+      if (fullText.length === 0) {
+        usedAcc!.consecutiveEmpties++;
+        usedAcc!.totalEmpty++;
+        // After 3 consecutive empties, proactively cool the account before hard block
+        if (usedAcc!.consecutiveEmpties >= 3) {
+          console.warn(`[ds-proxy] [${rid}] ⚠ ${usedAcc!.consecutiveEmpties} consecutive empty responses — proactive cooling ${usedAcc!.email || "??"}`);
+          coolAccount(usedAcc!);
+        }
+      } else {
+        usedAcc!.consecutiveEmpties = 0; // Reset on successful content
+        usedAcc!.totalWithContent++;
+        // Reset failure count on sustained success (5 good responses = trust restored)
+        if (usedAcc!.totalWithContent % 5 === 0 && usedAcc!.failureCount > 0) {
+          usedAcc!.failureCount = Math.max(0, usedAcc!.failureCount - 1);
+        }
+      }
       console.log(`[ds-proxy] [${rid}] ✓ non-stream done — account=${usedAcc!.email || "??"} chars=${fullText.length} totalMs=${totalMs}`);
       return Response.json({
         id: `chatcmpl-ds-${Date.now()}`,
