@@ -621,49 +621,65 @@ function openAIToDS(body: any, sessionId: string) {
     parts.push("IMPORTANT: Respond with ONLY a raw JSON object. No markdown code fences. No preamble. Start with { and end with }.");
   }
 
-  // ── Tool calling bridge ───────────────────────────────────────────────────
-  // The web API doesn't support native tool_calls. We bridge this by:
-  // 1. Injecting structured tool schemas (matching what the Claude proxy passes natively)
-  // 2. Specifying the exact output format
-  // 3. Enforcing tool_choice semantics
-  // 4. Preserving tool call history across turns
+  // ── Tool calling bridge (DSML-native) ──────────────────────────────────────
+  // DeepSeek V3/V4 was TRAINED to output tool calls in DSML format.
+  // Instead of fighting the model's training with custom <tool_call> tags,
+  // we align with it by injecting DSML-formatted tool schemas and examples.
+  // The paid API does this conversion internally — we replicate it here.
   if (tools.length > 0) {
-    // Build structured schemas — same info the native API would receive
-    const toolSchemas = tools.map((t: any) => {
+    // Build DSML tool definitions — mirrors what the paid API sends internally
+    const dsmlTools = tools.map((t: any) => {
       const fn = t.function || t;
       const name = fn.name || "unknown";
       const desc = fn.description || "";
       const params = fn.parameters || fn.input_schema || {};
-      // Compact schema: name(required_params) — description
       const required = params.required || [];
       const props = Object.entries(params.properties || {}).map(([k, v]: [string, any]) => {
         const type = v.type || "any";
-        const enumVals = v.enum ? ` [${v.enum.join("|")}]` : "";
-        const req = required.includes(k) ? "" : "?";
+        const enumVals = v.enum ? ` (enum: ${v.enum.join(", ")})` : "";
+        const req = required.includes(k) ? " [required]" : "";
         const propDesc = v.description ? ` — ${v.description}` : "";
-        return `  ${k}${req}: ${type}${enumVals}${propDesc}`;
+        return `  - ${k}: ${type}${enumVals}${req}${propDesc}`;
       }).join("\n");
-      return `${name}: ${desc}\n${props}`;
+      return `Tool: ${name}\n  Description: ${desc}\n  Parameters:\n${props || "    (none)"}`;
     }).join("\n\n");
 
-    // tool_choice enforcement — match what native API does
+    // Build an example using the first tool
+    const firstTool = tools[0]?.function || tools[0];
+    const exampleName = firstTool?.name || "entity";
+    const exampleParams = Object.entries((firstTool?.parameters?.properties || firstTool?.input_schema?.properties || {}) as Record<string, any>)
+      .slice(0, 2)
+      .map(([k, v]) => `<|DSML|parameter name="${k}" string="${(v as any).type === "string" ? "true" : "false"}">${(v as any).enum?.[0] || (v as any).type === "string" ? "example" : "0"}<|DSML|parameter>`)
+      .join("\n");
+
+    // tool_choice enforcement
     let choiceHint = "";
     if (toolChoice === "required" || toolChoice === "any") {
-      choiceHint = "\nYou MUST call at least one tool. Do not respond with plain text.";
+      choiceHint = "\nYou MUST call at least one tool using the DSML format below.";
     } else if (typeof toolChoice === "object" && toolChoice?.function?.name) {
-      choiceHint = `\nYou MUST call the tool "${toolChoice.function.name}". No other tool, no plain text.`;
+      choiceHint = `\nYou MUST call the tool "${toolChoice.function.name}" using the DSML format below.`;
     } else if (toolChoice === "none") {
       choiceHint = "\nDo NOT call any tools. Respond with plain text only.";
     }
-    // "auto" = model decides (default, no hint needed)
 
-    parts.push(`[TOOLS]
-Format: <tool_call>{"name":"TOOL_NAME","input":{...}}</tool_call>
-Rules: one call per line, valid JSON inside, stop after calls. Never invent XML tags.${choiceHint}
+    parts.push(`[AVAILABLE TOOLS]
+${dsmlTools}
 
-${toolSchemas}`);
+[TOOL CALL FORMAT]
+When you need to call a tool, use DSML format:
+<|DSML|tool_calls>
+<|DSML|invoke name="tool_name">
+<|DSML|parameter name="param_name" string="true">string_value<|DSML|parameter>
+<|DSML|parameter name="param_name" string="false">123<|DSML|parameter>
+</|DSML|invoke>
+</|DSML|tool_calls>
 
-    console.log(`[ds-proxy] [${rid}] [openAIToDS] injected ${tools.length} tool schemas, tool_choice=${typeof toolChoice === "object" ? JSON.stringify(toolChoice) : toolChoice || "auto"}`);
+string="true" for string values, string="false" for numbers/booleans/objects/arrays (use JSON for those).
+Multiple tool calls: multiple <|DSML|invoke> blocks inside one <|DSML|tool_calls>.
+After tool calls, stop — do not add text after </|DSML|tool_calls>.
+Never echo tool result data — summarize naturally.${choiceHint}`);
+
+    console.log(`[ds-proxy] [${rid}] [openAIToDS] injected ${tools.length} DSML tool schemas, tool_choice=${typeof toolChoice === "object" ? JSON.stringify(toolChoice) : toolChoice || "auto"}`);
   }
 
   // ── Messages ──────────────────────────────────────────────────────────────
@@ -679,23 +695,32 @@ ${toolSchemas}`);
     if (msg.role === "system") {
       if (text) { parts.push(`[SYSTEM]\n${text}`); systemCount++; }
     } else if (msg.role === "assistant") {
-      // Preserve tool calls in history so DeepSeek knows what it previously called
+      // Format previous tool calls in DSML so DeepSeek sees its own native format in context
       const toolCalls = (msg as any).tool_calls;
       if (toolCalls?.length) {
-        const callsText = toolCalls.map((tc: any) => {
+        const dsmlCalls = toolCalls.map((tc: any) => {
           const name = tc.function?.name || tc.name || "unknown";
-          const args = tc.function?.arguments || JSON.stringify(tc.input || {});
-          return `<tool_call>{"name":"${name}","input":${typeof args === "string" ? args : JSON.stringify(args)}}</tool_call>`;
+          let argsObj: Record<string, any> = {};
+          try {
+            argsObj = typeof tc.function?.arguments === "string"
+              ? JSON.parse(tc.function.arguments)
+              : tc.function?.arguments || tc.input || {};
+          } catch { argsObj = {}; }
+          const params = Object.entries(argsObj).map(([k, v]) => {
+            const isStr = typeof v === "string";
+            const val = isStr ? v : JSON.stringify(v);
+            return `<|DSML|parameter name="${k}" string="${isStr}">${val}<|DSML|parameter>`;
+          }).join("\n");
+          return `<|DSML|invoke name="${name}">\n${params}\n</|DSML|invoke>`;
         }).join("\n");
-        parts.push(`[ASSISTANT]\n${text ? text + "\n" : ""}${callsText}`);
+        parts.push(`[ASSISTANT]\n${text ? text + "\n" : ""}<|DSML|tool_calls>\n${dsmlCalls}\n</|DSML|tool_calls>`);
         assistantCount++;
       } else if (text) {
         parts.push(`[ASSISTANT]\n${text}`);
         assistantCount++;
       }
     } else if (msg.role === "tool") {
-      // Natural framing — prevents model from echoing raw format
-      const toolCallId = (msg as any).tool_call_id || "";
+      // Format tool results naturally
       parts.push(`Tool result:\n${text}`);
       toolResultCount++;
     } else if (text) {
@@ -730,9 +755,50 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
   const calls: ParsedToolCall[] = [];
   const tag = rid ? `[ds-proxy] [${rid}] [tool-parse]` : "[tool-parse]";
 
-  // Pattern 1: <tool_call>{"name":"...","input":{...}}</tool_call> (our injected format)
-  const p1 = /<(?:tool_call|_call|ool_call)>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g;
+  // Anti-leak: strip content inside markdown code fences before parsing
+  // (prevents matching tool-call examples in code blocks)
+  const codeBlockRanges: Array<[number, number]> = [];
+  const cbRegex = /```[\s\S]*?```/g;
+  let cbMatch;
+  while ((cbMatch = cbRegex.exec(text)) !== null) {
+    codeBlockRanges.push([cbMatch.index, cbMatch.index + cbMatch[0].length]);
+  }
+  const isInCodeBlock = (pos: number) => codeBlockRanges.some(([s, e]) => pos >= s && pos < e);
+
+  // Pattern 0 (HIGHEST PRIORITY): DSML format — DeepSeek's native trained format
+  // Matches both full-width ｜ and ASCII | pipes
+  const dsmlInvokeRegex = /<[｜|]DSML[｜|]invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/[｜|]DSML[｜|]invoke>/g;
+  const dsmlParamRegex = /<[｜|]DSML[｜|]parameter\s+name="([^"]+)"\s+string="(true|false)"[^>]*>([\s\S]*?)<[\/]?[｜|]DSML[｜|]parameter>/g;
   let m;
+  while ((m = dsmlInvokeRegex.exec(text)) !== null) {
+    if (isInCodeBlock(m.index)) { console.log(`${tag} P0 DSML match skipped (inside code block)`); continue; }
+    const toolName = m[1];
+    const paramsBlock = m[2];
+    const params: Record<string, any> = {};
+    let pm;
+    dsmlParamRegex.lastIndex = 0;
+    while ((pm = dsmlParamRegex.exec(paramsBlock)) !== null) {
+      const paramName = pm[1];
+      const isString = pm[2] === "true";
+      const rawVal = pm[3].trim();
+      if (isString) {
+        params[paramName] = rawVal;
+      } else {
+        try { params[paramName] = JSON.parse(rawVal); } catch { params[paramName] = rawVal; }
+      }
+    }
+    calls.push({ name: toolName, input: params });
+    console.log(`${tag} P0 match (DSML native): ${toolName}(${JSON.stringify(params).slice(0, 150)})`);
+  }
+
+  // If DSML matched, skip other patterns — DSML is authoritative
+  if (calls.length > 0) {
+    console.log(`${tag} ✓ extracted ${calls.length} tool call(s) via DSML from ${text.length} chars`);
+    return calls;
+  }
+
+  // Pattern 1: <tool_call>{"name":"...","input":{...}}</tool_call> (legacy custom format)
+  const p1 = /<(?:tool_call|_call|ool_call)>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g;
   while ((m = p1.exec(text)) !== null) {
     try {
       const parsed = JSON.parse(m[1]);
@@ -824,10 +890,16 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
 
 function stripToolCallText(text: string): string {
   return text
+    // DSML format (full-width and ASCII pipes)
+    .replace(/<[｜|]DSML[｜|]tool_calls>[\s\S]*?<\/[｜|]DSML[｜|]tool_calls>/g, "")
+    .replace(/<[｜|]DSML[｜|]invoke[\s\S]*?<\/[｜|]DSML[｜|]invoke>/g, "")
+    // Legacy custom format
     .replace(/<(?:tool_call|_call|ool_call)[^>]*>[\s\S]*?<\/tool_call>/g, "")
     .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/g, "")
     .replace(/<invoke\s+name="[^"]*"[\s\S]*?<\/invoke>/g, "")
+    // Markdown code block format
     .replace(/```(?:json)?\s*\n?\s*\{\s*"(?:tool_call|name)"[\s\S]*?\}\s*\n?```/g, "")
+    // Bare JSON format
     .replace(/\{"(?:tool_call|name)"\s*:\s*"[^"]+"\s*,\s*"(?:input|parameters|arguments)"\s*:\s*\{[\s\S]*?\}\s*\}/g, "")
     .trim();
 }
