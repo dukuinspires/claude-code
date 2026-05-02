@@ -632,8 +632,10 @@ function openAIToDS(body: any, sessionId: string) {
     parent_message_id: null,
     prompt: parts.join("\n\n"),
     ref_file_ids: [],
-    thinking_enabled: false,
+    thinking_enabled: !!body.thinking_enabled,
     search_enabled: !!body.search_enabled,
+    // Forward model_class if provided — controls Instant (V4-Flash) vs Expert (V4-Pro)
+    ...(body.model_class ? { model_class: body.model_class } : {}),
   };
 }
 
