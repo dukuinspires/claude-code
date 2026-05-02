@@ -618,44 +618,14 @@ function openAIToDS(body: any, sessionId: string) {
     parts.push("IMPORTANT: Respond with ONLY a raw JSON object. No markdown code fences. No preamble. Start with { and end with }.");
   }
 
-  // Inject tool schemas into the prompt when tools are present.
-  // DeepSeek web API doesn't support native tool_calls — we inject schemas
-  // into the prompt and parse the output for tool call patterns.
+  // The system prompt already describes tools in detail (MAI's orchestrator handles this).
+  // We only need to tell DeepSeek the OUTPUT FORMAT for tool calls, since the web API
+  // doesn't support native tool_calls. One line — no competing instructions.
   const tools = body.tools || [];
   if (tools.length > 0) {
-    const toolDefs = tools.map((t: any) => {
-      const fn = t.function || t;
-      const params = fn.parameters || fn.input_schema || {};
-      const requiredFields = params.required || [];
-      const propsList = Object.entries(params.properties || {}).map(([k, v]: [string, any]) => {
-        const req = requiredFields.includes(k) ? " (required)" : "";
-        return `    - ${k}${req}: ${v.description || v.type || "any"}`;
-      }).join("\n");
-      return `- ${fn.name}: ${fn.description || ""}\n  Parameters:\n${propsList || "    (none)"}`;
-    }).join("\n\n");
-
-    parts.push(`[TOOL CALLING]
-You MUST use this EXACT format to call tools — no variations, no alternative XML tags:
-<tool_call>{"name":"TOOL_NAME","input":{"PARAM":"VALUE"}}</tool_call>
-
-RULES:
-- The tag MUST be exactly <tool_call> and </tool_call> — never <search_...>, <invoke>, or any other tag
-- Inside the tags MUST be valid JSON with "name" and "input" fields
-- "name" must be one of the tool names listed below
-- Multiple tool calls: each on its own line
-- After all tool calls, STOP — no text after
-- If you don't need a tool, respond with normal text (no tags)
-
-WRONG (do NOT do these):
-<search_entity name="x"> ← WRONG tag name
-<invoke name="x"> ← WRONG format
-<tool_call name="x"> ← WRONG, name must be in JSON
-
-CORRECT:
-<tool_call>{"name":"entity","input":{"action":"list","entity_type":"campaigns"}}</tool_call>
-
-Available tools:
-${toolDefs}`);
+    parts.push(`[OUTPUT FORMAT FOR TOOL CALLS]
+When you want to call a tool, output: <tool_call>{"name":"TOOL_NAME","input":{...}}</tool_call>
+Multiple calls: one per line. After tool calls, stop. No other XML tags — only <tool_call>.`);
   }
 
   for (const msg of messages) {
