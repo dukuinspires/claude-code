@@ -618,10 +618,10 @@ function openAIToDS(body: any, sessionId: string) {
     parts.push("IMPORTANT: Respond with ONLY a raw JSON object. No markdown code fences. No preamble. Start with { and end with }.");
   }
 
-  // Inject tool schemas into the prompt ONLY for /v1/messages (Claude Code) requests.
-  // MAI uses /v1/chat/completions and handles tool routing on the SmartAssist side —
-  // injecting tool schemas there causes DeepSeek to output raw <tool_call> text.
-  const tools = body._injectTools ? (body.tools || []) : [];
+  // Inject tool schemas into the prompt when tools are present.
+  // DeepSeek web API doesn't support native tool_calls — we inject schemas
+  // into the prompt and parse the output for tool call patterns.
+  const tools = body.tools || [];
   if (tools.length > 0) {
     const toolDefs = tools.map((t: any) => {
       const fn = t.function || t;
@@ -634,13 +634,25 @@ function openAIToDS(body: any, sessionId: string) {
       return `- ${fn.name}: ${fn.description || ""}\n  Parameters:\n${propsList || "    (none)"}`;
     }).join("\n\n");
 
-    parts.push(`[TOOL DEFINITIONS]
-You have access to these tools. To call a tool, output EXACTLY this format on its own line:
-<tool_call>{"name":"tool_name","input":{"param":"value"}}</tool_call>
+    parts.push(`[TOOL CALLING]
+You MUST use this EXACT format to call tools — no variations, no alternative XML tags:
+<tool_call>{"name":"TOOL_NAME","input":{"PARAM":"VALUE"}}</tool_call>
 
-You may call multiple tools. Each tool call must be on its own line in the exact format above.
-After outputting tool calls, STOP. Do not add any text after the tool calls.
-If you don't need to call a tool, respond normally with text.
+RULES:
+- The tag MUST be exactly <tool_call> and </tool_call> — never <search_...>, <invoke>, or any other tag
+- Inside the tags MUST be valid JSON with "name" and "input" fields
+- "name" must be one of the tool names listed below
+- Multiple tool calls: each on its own line
+- After all tool calls, STOP — no text after
+- If you don't need a tool, respond with normal text (no tags)
+
+WRONG (do NOT do these):
+<search_entity name="x"> ← WRONG tag name
+<invoke name="x"> ← WRONG format
+<tool_call name="x"> ← WRONG, name must be in JSON
+
+CORRECT:
+<tool_call>{"name":"entity","input":{"action":"list","entity_type":"campaigns"}}</tool_call>
 
 Available tools:
 ${toolDefs}`);
