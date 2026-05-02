@@ -882,14 +882,17 @@ Bun.serve({
       // ── Convert Anthropic request → OpenAI request ──
       const oaiMessages: any[] = [];
 
-      // System message
+      // System message — prepend instruction to suppress visible reasoning
+      const suppressReasoning = "IMPORTANT: Never output your internal reasoning, chain-of-thought, or thinking process in your response. Only output the final answer directly. Do not start responses with phrases like 'The user...' or 'I need to...' or 'Let me think...'. Respond directly to the user.\n\n";
       if (anthropicBody.system) {
         const systemText = typeof anthropicBody.system === "string"
           ? anthropicBody.system
           : Array.isArray(anthropicBody.system)
             ? anthropicBody.system.map((b: any) => b.text || "").join("\n\n")
             : "";
-        if (systemText) oaiMessages.push({ role: "system", content: systemText });
+        if (systemText) oaiMessages.push({ role: "system", content: suppressReasoning + systemText });
+      } else {
+        oaiMessages.push({ role: "system", content: suppressReasoning.trim() });
       }
 
       // Convert messages
