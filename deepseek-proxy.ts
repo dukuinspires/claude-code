@@ -865,7 +865,16 @@ Bun.serve({
     // ── Anthropic Messages endpoint (for Claude Code compatibility) ────────
     // Accepts Anthropic /v1/messages format, converts to OpenAI, runs through
     // the DeepSeek completion pipeline, converts response back to Anthropic.
+    // Auth: x-api-key header (Anthropic convention) or Authorization Bearer (GCP IAM)
     if (url.pathname === "/v1/messages" && req.method === "POST") {
+      // Validate API key — accept x-api-key (Claude Code sends this), internal token, or GCP IAM
+      const apiKey = req.headers.get("x-api-key") || "";
+      const authHeader = req.headers.get("authorization") || "";
+      const isGcpAuth = authHeader.startsWith("Bearer ey"); // GCP identity tokens start with ey
+      if (!isGcpAuth && !isAdmin(req) && apiKey !== (process.env.DS_MESSAGES_API_KEY || process.env.INTERNAL_AUTH_TOKEN || "")) {
+        return Response.json({ error: "Invalid API key" }, { status: 401 });
+      }
+
       const anthropicBody = await req.json() as any;
       const isStream = !!anthropicBody.stream;
       console.log(`[ds-proxy] [${rid}] /v1/messages (Anthropic) model=${anthropicBody.model} stream=${isStream} msgs=${anthropicBody.messages?.length ?? 0}`);
