@@ -879,10 +879,10 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
   if (calls.length > 0) {
     console.log(`${tag} ✓ extracted ${calls.length} tool call(s) from ${text.length} chars of text`);
   } else if (text.length > 0) {
-    // Log when we have text but no tool calls detected — helps identify new patterns
-    const hasToolishContent = /<tool|<invoke|"tool_call"|"name".*"input"|```.*json/i.test(text);
+    // Log when text contains tool-call-specific patterns (not generic JSON)
+    const hasToolishContent = /<tool_call|<DSML|<invoke\s+name=|"tool_call"\s*:\s*"/i.test(text);
     if (hasToolishContent) {
-      console.warn(`${tag} ⚠ text looks like it contains tool calls but no pattern matched. Preview: "${text.slice(0, 300).replace(/\n/g, "\\n")}"`);
+      console.warn(`${tag} ⚠ text contains tool call markers but no pattern matched. Preview: "${text.slice(0, 300).replace(/\n/g, "\\n")}"`);
     }
   }
   return calls;
