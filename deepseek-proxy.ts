@@ -773,20 +773,51 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
     } catch (e) { console.warn(`${tag} P3h JSON parse failed: ${(e as any).message}`); }
   }
 
-  // Pattern 4: {"name":"tool_name","parameters":{...}} bare JSON (some DeepSeek outputs)
+  // Pattern 4: Markdown code block with JSON tool call (DeepSeek outputs these frequently)
+  // ```json\n{"tool_call":"database","input":{...}}\n``` or ```\n{"name":"entity",...}\n```
   if (calls.length === 0) {
-    const p3 = /\{"name"\s*:\s*"([^"]+)"\s*,\s*"(?:parameters|input|arguments)"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
-    while ((m = p3.exec(text)) !== null) {
+    const p4 = /```(?:json)?\s*\n?\s*\{\s*"(?:tool_call|name)"\s*:\s*"([^"]+)"\s*,\s*"(?:input|parameters|arguments)"\s*:\s*(\{[\s\S]*?\})\s*\}\s*\n?```/g;
+    while ((m = p4.exec(text)) !== null) {
       try {
         const input = JSON.parse(m[2]);
         calls.push({ name: m[1], input });
-        console.log(`${tag} P3 match (bare JSON): ${m[1]}(${JSON.stringify(input).slice(0, 100)})`);
+        console.log(`${tag} P4 match (markdown code block): ${m[1]}(${JSON.stringify(input).slice(0, 100)})`);
+      } catch (e) { console.warn(`${tag} P4 JSON parse failed: ${(e as any).message}`); }
+    }
+  }
+
+  // Pattern 5: {"name":"tool_name","parameters":{...}} bare JSON on its own line
+  if (calls.length === 0) {
+    const p5 = /\{"name"\s*:\s*"([^"]+)"\s*,\s*"(?:parameters|input|arguments)"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
+    while ((m = p5.exec(text)) !== null) {
+      try {
+        const input = JSON.parse(m[2]);
+        calls.push({ name: m[1], input });
+        console.log(`${tag} P5 match (bare JSON): ${m[1]}(${JSON.stringify(input).slice(0, 100)})`);
+      } catch { /* skip */ }
+    }
+  }
+
+  // Pattern 6: {"tool_call":"tool_name","input":{...}} — variant key name
+  if (calls.length === 0) {
+    const p6 = /\{"tool_call"\s*:\s*"([^"]+)"\s*,\s*"(?:input|parameters)"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
+    while ((m = p6.exec(text)) !== null) {
+      try {
+        const input = JSON.parse(m[2]);
+        calls.push({ name: m[1], input });
+        console.log(`${tag} P6 match (tool_call key): ${m[1]}(${JSON.stringify(input).slice(0, 100)})`);
       } catch { /* skip */ }
     }
   }
 
   if (calls.length > 0) {
     console.log(`${tag} ✓ extracted ${calls.length} tool call(s) from ${text.length} chars of text`);
+  } else if (text.length > 0) {
+    // Log when we have text but no tool calls detected — helps identify new patterns
+    const hasToolishContent = /<tool|<invoke|"tool_call"|"name".*"input"|```.*json/i.test(text);
+    if (hasToolishContent) {
+      console.warn(`${tag} ⚠ text looks like it contains tool calls but no pattern matched. Preview: "${text.slice(0, 300).replace(/\n/g, "\\n")}"`);
+    }
   }
   return calls;
 }
@@ -796,6 +827,8 @@ function stripToolCallText(text: string): string {
     .replace(/<(?:tool_call|_call|ool_call)[^>]*>[\s\S]*?<\/tool_call>/g, "")
     .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/g, "")
     .replace(/<invoke\s+name="[^"]*"[\s\S]*?<\/invoke>/g, "")
+    .replace(/```(?:json)?\s*\n?\s*\{\s*"(?:tool_call|name)"[\s\S]*?\}\s*\n?```/g, "")
+    .replace(/\{"(?:tool_call|name)"\s*:\s*"[^"]+"\s*,\s*"(?:input|parameters|arguments)"\s*:\s*\{[\s\S]*?\}\s*\}/g, "")
     .trim();
 }
 
