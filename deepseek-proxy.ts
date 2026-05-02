@@ -624,8 +624,9 @@ function openAIToDS(body: any, sessionId: string) {
   const tools = body.tools || [];
   if (tools.length > 0) {
     parts.push(`[OUTPUT FORMAT FOR TOOL CALLS]
-When you want to call a tool, output: <tool_call>{"name":"TOOL_NAME","input":{...}}</tool_call>
-Multiple calls: one per line. After tool calls, stop. No other XML tags — only <tool_call>.`);
+When calling a tool, output: <tool_call>{"name":"TOOL_NAME","input":{...}}</tool_call>
+Multiple calls: one per line. After tool calls, stop. No other XML tags.
+Never quote or echo tool result data in your response — summarize it naturally.`);
   }
 
   for (const msg of messages) {
@@ -638,7 +639,9 @@ Multiple calls: one per line. After tool calls, stop. No other XML tags — only
     if (msg.role === "system") parts.push(`[SYSTEM]\n${text}`);
     else if (msg.role === "assistant") parts.push(`[ASSISTANT]\n${text}`);
     else if (msg.role === "tool") {
-      parts.push(`[TOOL RESULT for ${(msg as any).tool_call_id || "unknown"}]\n${text}`);
+      // Format tool results as data context, not as echoed text.
+      // "The tool returned:" framing prevents the model from quoting the raw format.
+      parts.push(`The tool returned the following data:\n${text}`);
     } else parts.push(text);
   }
 
