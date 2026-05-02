@@ -611,23 +611,63 @@ function dsHeaders(acc: PoolAccount, powResponse?: string | null): Record<string
 // ─── OpenAI → DeepSeek body ───────────────────────────────────────────────────
 function openAIToDS(body: any, sessionId: string) {
   const messages: any[] = body.messages || [];
+  const tools = body.tools || [];
+  const toolChoice = body.tool_choice;
   const parts: string[] = [];
+  const rid = body._rid || "?"; // request ID for logging
 
-  // Prepend JSON enforcement instruction before context if requested
+  // ── JSON enforcement ──────────────────────────────────────────────────────
   if (body.response_format?.type === "json_object") {
     parts.push("IMPORTANT: Respond with ONLY a raw JSON object. No markdown code fences. No preamble. Start with { and end with }.");
   }
 
-  // The system prompt already describes tools in detail (MAI's orchestrator handles this).
-  // We only need to tell DeepSeek the OUTPUT FORMAT for tool calls, since the web API
-  // doesn't support native tool_calls. One line — no competing instructions.
-  const tools = body.tools || [];
+  // ── Tool calling bridge ───────────────────────────────────────────────────
+  // The web API doesn't support native tool_calls. We bridge this by:
+  // 1. Injecting structured tool schemas (matching what the Claude proxy passes natively)
+  // 2. Specifying the exact output format
+  // 3. Enforcing tool_choice semantics
+  // 4. Preserving tool call history across turns
   if (tools.length > 0) {
-    parts.push(`[OUTPUT FORMAT FOR TOOL CALLS]
-When calling a tool, output: <tool_call>{"name":"TOOL_NAME","input":{...}}</tool_call>
-Multiple calls: one per line. After tool calls, stop. No other XML tags.
-Never quote or echo tool result data in your response — summarize it naturally.`);
+    // Build structured schemas — same info the native API would receive
+    const toolSchemas = tools.map((t: any) => {
+      const fn = t.function || t;
+      const name = fn.name || "unknown";
+      const desc = fn.description || "";
+      const params = fn.parameters || fn.input_schema || {};
+      // Compact schema: name(required_params) — description
+      const required = params.required || [];
+      const props = Object.entries(params.properties || {}).map(([k, v]: [string, any]) => {
+        const type = v.type || "any";
+        const enumVals = v.enum ? ` [${v.enum.join("|")}]` : "";
+        const req = required.includes(k) ? "" : "?";
+        const propDesc = v.description ? ` — ${v.description}` : "";
+        return `  ${k}${req}: ${type}${enumVals}${propDesc}`;
+      }).join("\n");
+      return `${name}: ${desc}\n${props}`;
+    }).join("\n\n");
+
+    // tool_choice enforcement — match what native API does
+    let choiceHint = "";
+    if (toolChoice === "required" || toolChoice === "any") {
+      choiceHint = "\nYou MUST call at least one tool. Do not respond with plain text.";
+    } else if (typeof toolChoice === "object" && toolChoice?.function?.name) {
+      choiceHint = `\nYou MUST call the tool "${toolChoice.function.name}". No other tool, no plain text.`;
+    } else if (toolChoice === "none") {
+      choiceHint = "\nDo NOT call any tools. Respond with plain text only.";
+    }
+    // "auto" = model decides (default, no hint needed)
+
+    parts.push(`[TOOLS]
+Format: <tool_call>{"name":"TOOL_NAME","input":{...}}</tool_call>
+Rules: one call per line, valid JSON inside, stop after calls. Never invent XML tags.${choiceHint}
+
+${toolSchemas}`);
+
+    console.log(`[ds-proxy] [${rid}] [openAIToDS] injected ${tools.length} tool schemas, tool_choice=${typeof toolChoice === "object" ? JSON.stringify(toolChoice) : toolChoice || "auto"}`);
   }
+
+  // ── Messages ──────────────────────────────────────────────────────────────
+  let systemCount = 0, assistantCount = 0, toolResultCount = 0, userCount = 0;
 
   for (const msg of messages) {
     const text = typeof msg.content === "string"
@@ -635,31 +675,42 @@ Never quote or echo tool result data in your response — summarize it naturally
       : Array.isArray(msg.content)
         ? msg.content.map((b: any) => b.text || "").join("")
         : "";
-    if (!text) continue;
-    if (msg.role === "system") parts.push(`[SYSTEM]\n${text}`);
-    else if (msg.role === "assistant") {
-      // Include tool calls the assistant made (so DeepSeek has context of its own actions)
+
+    if (msg.role === "system") {
+      if (text) { parts.push(`[SYSTEM]\n${text}`); systemCount++; }
+    } else if (msg.role === "assistant") {
+      // Preserve tool calls in history so DeepSeek knows what it previously called
       const toolCalls = (msg as any).tool_calls;
       if (toolCalls?.length) {
         const callsText = toolCalls.map((tc: any) => {
           const name = tc.function?.name || tc.name || "unknown";
           const args = tc.function?.arguments || JSON.stringify(tc.input || {});
-          return `<tool_call>{"name":"${name}","input":${args}}</tool_call>`;
+          return `<tool_call>{"name":"${name}","input":${typeof args === "string" ? args : JSON.stringify(args)}}</tool_call>`;
         }).join("\n");
         parts.push(`[ASSISTANT]\n${text ? text + "\n" : ""}${callsText}`);
+        assistantCount++;
       } else if (text) {
         parts.push(`[ASSISTANT]\n${text}`);
+        assistantCount++;
       }
     } else if (msg.role === "tool") {
-      // Format tool results naturally — prevents the model from quoting raw format
-      parts.push(`The tool returned the following data:\n${text}`);
-    } else parts.push(text);
+      // Natural framing — prevents model from echoing raw format
+      const toolCallId = (msg as any).tool_call_id || "";
+      parts.push(`Tool result:\n${text}`);
+      toolResultCount++;
+    } else if (text) {
+      parts.push(text);
+      userCount++;
+    }
   }
+
+  const prompt = parts.join("\n\n");
+  console.log(`[ds-proxy] [${rid}] [openAIToDS] prompt=${prompt.length} chars | system=${systemCount} assistant=${assistantCount} tool_results=${toolResultCount} user=${userCount} tools=${tools.length}`);
 
   return {
     chat_session_id: sessionId,
     parent_message_id: null,
-    prompt: parts.join("\n\n"),
+    prompt,
     ref_file_ids: [],
     thinking_enabled: !!body.thinking_enabled,
     search_enabled: !!body.search_enabled,
@@ -783,7 +834,7 @@ async function doCompletion(body: any, acc: PoolAccount, rid: string) {
   const upstream = await fetch(`${DS_API}/api/v0/chat/completion`, {
     method: "POST",
     headers: dsHeaders(acc, pow),
-    body: JSON.stringify(openAIToDS(body, sessionId)),
+    body: JSON.stringify(openAIToDS({ ...body, _rid: rid }, sessionId)),
   });
   console.log(`[ds-proxy] [completion] [${rid}] upstream HTTP ${upstream.status} (${Date.now() - t0}ms total)`);
 
@@ -1390,6 +1441,9 @@ Bun.serve({
             usedAcc!.failureCount = Math.max(0, usedAcc!.failureCount - 1);
           }
         }
+
+        // Log response preview for debugging
+        console.log(`[ds-proxy] [${rid}] [response] preview: "${fullText.slice(0, 200).replace(/\n/g, "\\n")}${fullText.length > 200 ? "..." : ""}"`);
 
         // Check for tool calls in the collected text
         const streamToolCalls = extractToolCallsFromText(fullText, rid);
