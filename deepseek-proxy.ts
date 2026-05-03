@@ -2198,8 +2198,10 @@ Bun.serve({
           break;
         } catch (err: any) {
           console.error(`[ds-proxy] [${rid}] ✗ doCompletion threw (${acc.email}): ${err.message}`);
-          // If the error contains 40003, the token is expired — trigger relogin, not just cooldown
-          if (err.message?.includes("40003")) {
+          // Session creation failure with a password-backed account = likely expired token.
+          // Trigger relogin instead of just cooling — gets a fresh token via VPS OAuth.
+          if (acc.password && (err.message?.includes("Session create failed") || err.message?.includes("40003"))) {
+            console.log(`[ds-proxy] [${rid}] → treating as expired (hasPassword=true) — triggering relogin`);
             expireAccount(acc);
           } else {
             coolAccount(acc);
