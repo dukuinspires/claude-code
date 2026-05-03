@@ -1767,7 +1767,7 @@ Bun.serve({
       pool = accounts;
       const next = poolSummary();
       console.log(`[ds-proxy] [${rid}] 🔄 pool reloaded — before: total=${prev.total} active=${prev.active} | after: total=${next.total} active=${next.active}`);
-      pool.forEach(a => console.log(`[ds-proxy] [${rid}]   • ${a.email || "unknown"} | status=${a.status} | hasToken=${!!a.token} | hasDliq=${!!a.dliq}`));
+      pool.forEach(a => console.log(`[ds-proxy] [${rid}]   • ${a.email || "unknown"} | status=${a.status} | hasToken=${!!a.token} | hasPassword=${!!a.password} | hasDliq=${!!a.dliq}`));
       return Response.json({ ok: true, total: next.total, active: next.active });
     }
 
