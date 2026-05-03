@@ -1011,7 +1011,7 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
       ref_file_ids: [offloadedFileId],
       thinking_enabled: !!body.thinking_enabled,
       search_enabled: !!body.search_enabled,
-      model_type: body.model_type || "expert",
+      model_type: body.model_type || "chat",
     };
   }
 
@@ -1097,8 +1097,10 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
     ref_file_ids: [],
     thinking_enabled: !!body.thinking_enabled,
     search_enabled: !!body.search_enabled,
-    // model_type controls Instant (V4-Flash) vs Expert (V4-Pro) on the free web tier
-    model_type: body.model_type || "expert",
+    // model_type controls Chat (V3/V4-Flash, better tool calling) vs Expert (R1/V4-Pro, reasoning)
+    // Default to "chat" — V3/Flash follows DSML format more reliably, no <think> blocks,
+    // higher input tolerance. Use "expert" only when caller explicitly requests reasoning.
+    model_type: body.model_type || "chat",
   };
 }
 
@@ -1340,7 +1342,7 @@ async function doCompletion(body: any, acc: PoolAccount, rid: string) {
   let offloadedFileId: string | undefined;
   const messages: any[] = body.messages || [];
   const tools: any[] = body.tools || [];
-  const modelType: string = body.model_type || "expert";
+  const modelType: string = body.model_type || "chat";
 
   if (tools.length > 0 && messages.length > 2) {
     // Estimate conversation history size only — tool schemas are in the preamble and
@@ -1656,7 +1658,7 @@ Bun.serve({
         max_tokens: anthropicBody.max_tokens || 4096,
         temperature: anthropicBody.temperature,
         stream: isStream,
-        model_type: "expert",
+        model_type: anthropicBody.thinking ? "expert" : "chat",
         ...(anthropicBody.thinking ? { thinking_enabled: true } : {}),
       };
 
