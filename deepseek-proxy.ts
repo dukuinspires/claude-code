@@ -797,7 +797,7 @@ function buildHistoryTranscript(messages: any[]): string {
     if (msg.role === "tool") {
       const toolCallId = (msg as any).tool_call_id || "";
       const toolName = (msg as any).name || "";
-      lines.push(`[name=${toolName} tool_call_id=${toolCallId}]`);
+      lines.push(`Tool result from ${toolName}:`);
     }
     if (hasToolCalls) {
       for (const tc of msg.tool_calls) {
@@ -805,9 +805,9 @@ function buildHistoryTranscript(messages: any[]): string {
         const argsStr = typeof tc.function?.arguments === "string"
           ? tc.function.arguments
           : JSON.stringify(tc.function?.arguments ?? (tc as any).input ?? {});
-        // Use "invoked" label instead of "tool_call" to prevent the model from
-        // echoing this format in its output instead of generating proper DSML.
-        lines.push(`[invoked: ${name}(${argsStr})]`);
+        // Use prose format — bracket patterns like [tool_call:] and [invoked:]
+        // get echoed by the model as tool call attempts. Plain prose doesn't.
+        lines.push(`Called ${name} with ${argsStr}`);
       }
     }
     if (text) lines.push(text);
@@ -1422,8 +1422,9 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
     const hasInvoke = /<invoke\s+name=/i.test(text);
     const hasFuncCalls = /<function_calls>/i.test(text);
     const hasToolCalls = /<tool_calls>/i.test(text);
-    if (hasDSMLPipe || hasInvoke || hasFuncCalls || hasToolCalls) {
-      console.warn(`${tag} ⚠ tool-call markers found but parser didn't match (DSML=${hasDSMLPipe} invoke=${hasInvoke} func_calls=${hasFuncCalls} tool_calls=${hasToolCalls}). Preview: "${text.slice(0, 400).replace(/\n/g, "\\n")}"`);
+    const hasHistoryEcho = /\[(?:tool_call|invoked):\s*\w+\(/i.test(text);
+    if (hasDSMLPipe || hasInvoke || hasFuncCalls || hasToolCalls || hasHistoryEcho) {
+      console.warn(`${tag} ⚠ tool-call markers found but parser didn't match (DSML=${hasDSMLPipe} invoke=${hasInvoke} func_calls=${hasFuncCalls} tool_calls=${hasToolCalls} historyEcho=${hasHistoryEcho}). Preview: "${text.slice(0, 400).replace(/\n/g, "\\n")}"`);
     }
   }
 
@@ -1504,7 +1505,8 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
   // When conversation history is uploaded as a file, the model sees "[tool_call: entity({...})]"
   // entries and sometimes generates new tool calls in the same format instead of DSML.
   // Format: [tool_call: name({json_args})] or multiple separated by ; or newlines
-  const historyEchoRegex = /\[tool_call:\s*(\w+)\((\{[\s\S]*?\})\)\s*\]/g;
+  // Match both old [tool_call:] and new [invoked:] formats — model echoes whatever label we use
+  const historyEchoRegex = /\[(?:tool_call|invoked):\s*(\w+)\((\{[\s\S]*?\})\)\s*\]/g;
   let hm;
   while ((hm = historyEchoRegex.exec(text)) !== null) {
     if (isInCodeBlock(hm.index)) continue;
@@ -1527,8 +1529,9 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
 
 function stripToolCallText(text: string): string {
   text = normalizeDsmlText(text);
-  // Strip "FINISHED" marker — DeepSeek R1/V3 sometimes appends this to every response
-  text = text.replace(/FINISHED\s*$/g, "").replace(/^FINISHED\s*/g, "");
+  // Strip "FINISHED" marker — DeepSeek appends this to responses (learned from SSE stream format)
+  // Also strip it mid-text (model sometimes puts it between sentences)
+  text = text.replace(/FINISHED/g, "");
   return text
     // DSML V4: <｜DSML｜tool_calls>...<[/]｜DSML｜tool_calls> (closing slash optional)
     .replace(/<[｜|]?DSML[｜|]tool_calls>[\s\S]*?<[\/]?[｜|]?DSML[｜|]tool_calls>/g, "")
@@ -1546,10 +1549,10 @@ function stripToolCallText(text: string): string {
     .replace(/<｜end▁of▁sentence｜>/g, "")
     // Bare JSON tool call pattern
     .replace(/\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/g, "")
-    // History echo format: [tool_call: name({...})]
-    .replace(/\[tool_call:\s*\w+\(\{[\s\S]*?\}\)\s*\]/g, "")
+    // History echo format: [tool_call: name({...})] or [invoked: name({...})]
+    .replace(/\[(?:tool_call|invoked):\s*\w+\(\{[\s\S]*?\}\)\s*\]/g, "")
     // Multiple history-echo calls separated by semicolons
-    .replace(/\[tool_call:[\s\S]*?\]/g, "")
+    .replace(/\[(?:tool_call|invoked):[\s\S]*?\]/g, "")
     .trim();
 }
 
@@ -2238,7 +2241,7 @@ Bun.serve({
         let toolSieveActive = false; // true once DSML marker detected
 
         // DSML detection patterns — if any match in accumulated text, switch to buffering
-        const DSML_MARKERS = /(?:<[｜|＃#\uff00-\uffff]|<DSML|<dsml|<psml|<invoke\s|<function_calls|<tool_calls|\[tool_call:)/i;
+        const DSML_MARKERS = /(?:<[｜|＃#\uff00-\uffff]|<DSML|<dsml|<psml|<invoke\s|<function_calls|<tool_calls|\[tool_call:|\[invoked:)/i;
 
         // Create the response stream that we'll write to incrementally
         let streamController: ReadableStreamDefaultController | null = null;
