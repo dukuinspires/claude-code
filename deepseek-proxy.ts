@@ -2476,6 +2476,43 @@ Bun.serve({
         }
 
         const totalMs = Date.now() - t0;
+
+        // ── Instant retry on empty/malformed response ─────────────────────
+        // With 5 accounts, we can afford to retry once on a DIFFERENT account
+        // instead of returning an empty result or leaked DSML to the user.
+        const streamToolCalls_pre = extractToolCallsFromText(fullText, rid);
+        const hasDSMLLeak = fullText.length > 0 && streamToolCalls_pre.length === 0 &&
+          /(?:<[｜|]|<DSML|\[(?:tool_call|invoked):)/i.test(fullText);
+
+        if ((fullText.length === 0 || hasDSMLLeak) && !body._isRetry) {
+          const retryReason = fullText.length === 0 ? "empty response" : "DSML leak (parser miss)";
+          console.warn(`[ds-proxy] [${rid}] ⚠ ${retryReason} — instant retry on different account`);
+          usedAcc!.consecutiveEmpties++;
+          // Don't close the response stream — retry the entire request
+          try { streamController?.close(); } catch { /* already closed */ }
+
+          // Retry with a different account (mark body so we don't retry infinitely)
+          const retryBody = { ...body, _isRetry: true };
+          const retryRid = `${rid}-retry`;
+          const retryAcc = pickAccount();
+          if (retryAcc && retryAcc !== usedAcc) {
+            console.log(`[ds-proxy] [${rid}] → retrying on ${retryAcc.email} (was ${usedAcc!.email})`);
+            retryAcc.lastUsed = Date.now();
+            recordRequest(retryAcc);
+            try {
+              const retryResult = await doCompletion(retryBody, retryAcc, retryRid);
+              if (retryResult.upstream.ok) {
+                // Return the retry response instead
+                return new Response(retryResult.upstream.body, {
+                  headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+                });
+              }
+            } catch (retryErr: any) {
+              console.warn(`[ds-proxy] [${rid}] retry also failed: ${retryErr.message}`);
+            }
+          }
+        }
+
         // Track empty responses
         if (fullText.length === 0) {
           usedAcc!.consecutiveEmpties++;
