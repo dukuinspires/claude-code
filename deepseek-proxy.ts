@@ -787,7 +787,9 @@ function buildHistoryTranscript(messages: any[]): string {
         const argsStr = typeof tc.function?.arguments === "string"
           ? tc.function.arguments
           : JSON.stringify(tc.function?.arguments ?? (tc as any).input ?? {});
-        lines.push(`[tool_call: ${name}(${argsStr})]`);
+        // Use "invoked" label instead of "tool_call" to prevent the model from
+        // echoing this format in its output instead of generating proper DSML.
+        lines.push(`[invoked: ${name}(${argsStr})]`);
       }
     }
     if (text) lines.push(text);
@@ -1477,6 +1479,29 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
 
   if (calls.length > 0) {
     console.log(`${tag} ✓ extracted ${calls.length} tool call(s) via bare JSON from ${text.length} chars`);
+    return calls;
+  }
+
+  // Pattern 3 (HISTORY ECHO): [tool_call: name({...})] — model echoes our transcript format.
+  // When conversation history is uploaded as a file, the model sees "[tool_call: entity({...})]"
+  // entries and sometimes generates new tool calls in the same format instead of DSML.
+  // Format: [tool_call: name({json_args})] or multiple separated by ; or newlines
+  const historyEchoRegex = /\[tool_call:\s*(\w+)\((\{[\s\S]*?\})\)\s*\]/g;
+  let hm;
+  while ((hm = historyEchoRegex.exec(text)) !== null) {
+    if (isInCodeBlock(hm.index)) continue;
+    const toolName = hm[1];
+    try {
+      const params = JSON.parse(repairLooseJsonArrays(repairInvalidBackslashes(hm[2])));
+      calls.push({ name: toolName, input: params });
+      console.log(`${tag} P3 match (history echo): ${toolName}(${JSON.stringify(params).slice(0, 150)})`);
+    } catch {
+      console.warn(`${tag} P3 JSON parse failed for ${toolName}: ${hm[2].slice(0, 100)}`);
+    }
+  }
+
+  if (calls.length > 0) {
+    console.log(`${tag} ✓ extracted ${calls.length} tool call(s) via history echo from ${text.length} chars`);
   }
 
   return calls;
@@ -1503,6 +1528,10 @@ function stripToolCallText(text: string): string {
     .replace(/<｜end▁of▁sentence｜>/g, "")
     // Bare JSON tool call pattern
     .replace(/\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/g, "")
+    // History echo format: [tool_call: name({...})]
+    .replace(/\[tool_call:\s*\w+\(\{[\s\S]*?\}\)\s*\]/g, "")
+    // Multiple history-echo calls separated by semicolons
+    .replace(/\[tool_call:[\s\S]*?\]/g, "")
     .trim();
 }
 
