@@ -963,9 +963,10 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
     const prompt =
       BOS + preamble + "\n\n" +
       USER_TOKEN +
-      "Continue from the latest state in the attached DS2API_HISTORY.txt context. " +
-      "Treat it as the current working state and answer the latest user request directly. " +
-      "Use ONLY data from the tool results in the attached history — do not fabricate any values." +
+      "Review the attached DS2API_HISTORY.txt which contains the conversation so far. " +
+      "Answer the latest user request. If you need fresh data that is not already in the history, " +
+      "call the appropriate tool — do not fabricate or guess values. " +
+      "Never invent names, IDs, counts, or any other data." +
       ASST_OPEN;
     userCount++;
     console.log(`[ds-proxy] [${rid}] [openAIToDS] file-offload mode — prompt=${prompt.length} chars (history in file ${offloadedFileId})`);
@@ -1284,15 +1285,19 @@ async function doCompletion(body: any, acc: PoolAccount, rid: string) {
   const modelType: string = body.model_type || "expert";
 
   if (tools.length > 0 && messages.length > 2) {
-    // Quick size estimate: sum of all message content + rough tool schema estimate
+    // Estimate conversation history size only — tool schemas are in the preamble and
+    // always visible to the model regardless of context length, so counting them here
+    // would cause every request with many tools (42 in MAI) to hit the offload threshold
+    // even on the very first message, defeating the purpose of the threshold entirely.
+    // Context offload is for LONG CONVERSATION history (tool results, prior turns),
+    // not for the fixed preamble overhead.
     const msgChars = messages.reduce((sum, m) => {
       const text = typeof m.content === "string" ? m.content.length
         : Array.isArray(m.content) ? m.content.reduce((s: number, b: any) => s + (b.text?.length || 0), 0)
         : 0;
       return sum + text;
     }, 0);
-    const toolChars = tools.reduce((sum, t) => sum + JSON.stringify(t).length, 0);
-    const estimatedSize = msgChars + toolChars + PROMPT_OVERHEAD_CHARS;
+    const estimatedSize = msgChars + PROMPT_OVERHEAD_CHARS;
 
     if (estimatedSize > CONTEXT_OFFLOAD_CHARS) {
       console.log(`[ds-proxy] [${rid}] [context-offload] estimated ${estimatedSize} chars > ${CONTEXT_OFFLOAD_CHARS} threshold — uploading history`);
