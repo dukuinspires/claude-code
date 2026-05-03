@@ -14,6 +14,8 @@
  *   SMARTASSIST_URL    — for persisting tokens back to SmartAssist after re-login
  *   VPS_PROXY_URL      — VPS base URL for routing login calls through clean IP
  *   SMTP_PROXY_SECRET  — auth secret for VPS /ds-proxy endpoint
+ *   DS_CACHE_URL       — VPS ds-cache service URL (e.g., http://192.3.15.37:3081)
+ *                         Pre-solved PoW + session pool. Falls back to on-demand if unavailable.
  */
 
 import { readFileSync } from "fs";
@@ -235,6 +237,8 @@ async function syncPoolFromSmartAssist() {
       console.log(`[ds-proxy] [sync] ✓ result: ${JSON.stringify(data)}`);
       const s = poolSummary();
       console.log(`[ds-proxy] [sync] pool after sync — total=${s.total} active=${s.active} cooling=${s.cooling} dead=${s.dead}`);
+      // Push accounts to VPS cache so it starts pre-solving PoW + creating sessions
+      syncAccountsToVpsCache().catch(() => {});
     } else {
       const body = await res.text().catch(() => "");
       console.warn(`[ds-proxy] [sync] ⚠ HTTP ${res.status} — starting with empty pool. Body: ${body.slice(0, 300)}`);
@@ -549,6 +553,70 @@ function solvePoW(challenge: string, salt: string, difficulty: number, expireAt:
     return ok !== 0 ? answer : null;
   } finally {
     __wbindgen_add_to_stack_pointer(16);
+  }
+}
+
+// ─── VPS Cache Client ────────────────────────────────────────────────────────
+// Pre-solved PoW + session pool from persistent VPS nodes.
+// Falls back gracefully to on-demand if VPS is unavailable.
+const DS_CACHE_URL = process.env.DS_CACHE_URL || process.env.VPS_PROXY_URL?.replace(":3080", ":3081") || "";
+const DS_CACHE_SECRET = process.env.SMTP_PROXY_SECRET || "";
+
+async function getVpsPow(token: string, path: string): Promise<string | null> {
+  if (!DS_CACHE_URL) return null;
+  try {
+    const res = await fetch(`${DS_CACHE_URL}/pow?token=${encodeURIComponent(token)}&path=${encodeURIComponent(path)}`, {
+      headers: { "x-ds-cache-secret": DS_CACHE_SECRET },
+      signal: AbortSignal.timeout(3000), // 3s max — don't block longer than solving locally
+    });
+    if (!res.ok) return null;
+    const data = await res.json() as any;
+    if (data.pow) {
+      console.log(`[ds-proxy] [vps-cache] PoW ${data.hit ? "HIT" : "solved-on-vps"} for ${path}`);
+      return data.pow;
+    }
+    return null;
+  } catch {
+    return null; // VPS unreachable — fall back to local solve
+  }
+}
+
+async function getVpsSession(token: string): Promise<string | null> {
+  if (!DS_CACHE_URL) return null;
+  try {
+    const res = await fetch(`${DS_CACHE_URL}/session?token=${encodeURIComponent(token)}`, {
+      headers: { "x-ds-cache-secret": DS_CACHE_SECRET },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json() as any;
+    if (data.sessionId) {
+      console.log(`[ds-proxy] [vps-cache] session ${data.hit ? "HIT" : "created-on-vps"} (${data.sessionId.slice(0, 8)}...)`);
+      return data.sessionId;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Push current account tokens to VPS cache so it can pre-solve */
+async function syncAccountsToVpsCache(): Promise<void> {
+  if (!DS_CACHE_URL) return;
+  const activeAccounts = pool
+    .filter(a => a.status === "active" && a.token)
+    .map(a => ({ token: a.token, email: a.email }));
+  if (activeAccounts.length === 0) return;
+  try {
+    await fetch(`${DS_CACHE_URL}/accounts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-ds-cache-secret": DS_CACHE_SECRET },
+      body: JSON.stringify({ accounts: activeAccounts }),
+      signal: AbortSignal.timeout(5000),
+    });
+    console.log(`[ds-proxy] [vps-cache] synced ${activeAccounts.length} accounts to VPS cache`);
+  } catch (e: any) {
+    console.warn(`[ds-proxy] [vps-cache] sync failed: ${e.message}`);
   }
 }
 
@@ -1429,10 +1497,9 @@ async function doCompletion(body: any, acc: PoolAccount, rid: string) {
   const isMultiTurn = tools.length > 0 && messages.length > 2;
 
   // ── Phase 1: Parallel setup ─────────────────────────────────────────────
-  // Session create (337ms) + completion PoW (381ms) run in parallel.
-  // For multi-turn: also prepare the context file content synchronously
-  // (CPU-bound, ~5ms) so it's ready for upload immediately.
-  console.log(`[ds-proxy] [completion] [${rid}] parallel setup for ${acc.email || "??"} (multiTurn=${isMultiTurn} model=${modelType})`);
+  // Try VPS cache first (pre-solved PoW + pre-created sessions).
+  // If VPS is unavailable or cache misses, fall back to on-demand in parallel.
+  console.log(`[ds-proxy] [completion] [${rid}] setup for ${acc.email || "??"} (multiTurn=${isMultiTurn} model=${modelType})`);
 
   let contextContent: string | undefined;
   let toolSchemas: any[] | undefined;
@@ -1441,22 +1508,36 @@ async function doCompletion(body: any, acc: PoolAccount, rid: string) {
     contextContent = buildContextFile(messages, toolSchemas);
   }
 
-  const [sessionRes, completionPow] = await Promise.all([
-    fetch(`${DS_API}/api/v0/chat_session/create`, {
-      method: "POST",
-      headers: dsHeaders(acc),
-      body: JSON.stringify({ agent: "chat", character_id: null }),
-    }),
-    getPowResponse("/api/v0/chat/completion", acc.token),
+  // Try VPS cache for session + PoW in parallel
+  const [vpsSession, vpsPow] = await Promise.all([
+    getVpsSession(acc.token),
+    getVpsPow(acc.token, "/api/v0/chat/completion"),
   ]);
 
-  const sessionData = await sessionRes.json() as any;
-  const sessionId = sessionData?.data?.biz_data?.chat_session?.id;
-  if (!sessionId) {
-    console.error(`[ds-proxy] [completion] [${rid}] ✗ session create failed HTTP ${sessionRes.status}: ${JSON.stringify(sessionData).slice(0, 200)}`);
-    throw new Error(`Session create failed: ${JSON.stringify(sessionData).slice(0, 200)}`);
+  // Fall back to on-demand for anything the VPS didn't provide
+  let sessionId = vpsSession;
+  let completionPow = vpsPow;
+
+  if (!sessionId || !completionPow) {
+    const fallbacks = await Promise.all([
+      !sessionId ? fetch(`${DS_API}/api/v0/chat_session/create`, {
+        method: "POST",
+        headers: dsHeaders(acc),
+        body: JSON.stringify({ agent: "chat", character_id: null }),
+      }).then(async r => {
+        const d = await r.json() as any;
+        return d?.data?.biz_data?.chat_session?.id || null;
+      }) : Promise.resolve(sessionId),
+      !completionPow ? getPowResponse("/api/v0/chat/completion", acc.token) : Promise.resolve(completionPow),
+    ]);
+    sessionId = fallbacks[0] as string;
+    completionPow = fallbacks[1] as string | null;
   }
-  console.log(`[ds-proxy] [completion] [${rid}] session=${sessionId} pow=${completionPow ? "solved" : "skipped"} (${Date.now() - t0}ms parallel setup)`);
+
+  if (!sessionId) {
+    throw new Error("Session create failed (both VPS cache and on-demand)");
+  }
+  console.log(`[ds-proxy] [completion] [${rid}] session=${sessionId} pow=${completionPow ? "ready" : "skipped"} vps=${vpsSession ? "hit" : "miss"}+${vpsPow ? "hit" : "miss"} (${Date.now() - t0}ms setup)`);
 
   // ── Phase 2: Context file upload (multi-turn only) ──────────────────────
   // Runs AFTER session is ready. PoW for file upload is separate from
