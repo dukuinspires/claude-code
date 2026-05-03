@@ -1409,7 +1409,6 @@ Bun.serve({
       if (!accounts.length) return Response.json({ error: "accounts array required" }, { status: 400 });
       const prev = poolSummary();
       pool = accounts;
-      poolIndex = 0;
       const next = poolSummary();
       console.log(`[ds-proxy] [${rid}] 🔄 pool reloaded — before: total=${prev.total} active=${prev.active} | after: total=${next.total} active=${next.active}`);
       pool.forEach(a => console.log(`[ds-proxy] [${rid}]   • ${a.email || "unknown"} | status=${a.status} | hasToken=${!!a.token} | hasDliq=${!!a.dliq}`));
