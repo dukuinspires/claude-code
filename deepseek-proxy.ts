@@ -928,6 +928,7 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
       `You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n\n` +
       `After </｜DSML｜tool_calls> STOP immediately — no trailing text or explanation.\n\n` +
       `CRITICAL DATA RULES:\n` +
+      `- ALWAYS call a tool to answer data questions (lists, counts, names, IDs, statuses). NEVER answer from memory or context.\n` +
       `- Tool results are AUTHORITATIVE. NEVER fabricate, invent, or substitute names, IDs, counts, or any values.\n` +
       `- If a tool returns N items, your response must reference exactly those N items verbatim.\n` +
       `- If you need data, call a tool — NEVER guess or hallucinate.` +
@@ -1108,9 +1109,34 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
 
 interface ParsedToolCall { name: string; input: Record<string, any> }
 
+/**
+ * Normalize Unicode lookalike characters the model uses in place of the DSML
+ * full-width pipe ｜ (U+FF5C). DeepSeek sometimes generates ︵ (U+FE35),
+ * （ (U+FF08), or other curved/bracket variants, especially when routed to R1.
+ * Normalizing before parsing makes all downstream regexes work without changes.
+ */
+function normalizeDsmlText(text: string): string {
+  // Replace any character that appears between < and DSML or after DSML and before >
+  // with the canonical full-width pipe ｜ (U+FF5C).
+  // Common lookalikes observed: ︵ (FE35), ︶ (FE36), （ (FF08), ） (FF09), | (007C)
+  return text
+    .replace(/<[^\x00-\x7F｜]DSML[^\x00-\x7F｜]/g, (m) => "<｜DSML｜")
+    .replace(/<\/[^\x00-\x7F｜]DSML[^\x00-\x7F｜]/g, "</｜DSML｜")
+    // Also handle when the model omits pipes entirely: <DSMLinvoke → <｜DSML｜invoke
+    .replace(/<DSML([a-z_])/gi, "<｜DSML｜$1")
+    .replace(/<\/DSML([a-z_])/gi, "</｜DSML｜$1");
+}
+
 function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] {
   const calls: ParsedToolCall[] = [];
   const tag = rid ? `[ds-proxy] [${rid}] [tool-parse]` : "[tool-parse]";
+
+  // Normalize DSML lookalike characters before any regex runs
+  const normalizedText = normalizeDsmlText(text);
+  if (normalizedText !== text) {
+    console.log(`${tag} [normalize] DSML character variants normalized (${text.length} chars)`);
+  }
+  text = normalizedText;
 
   // Anti-leak: strip content inside markdown code fences before parsing
   // (prevents matching tool-call examples in code blocks)
@@ -1257,6 +1283,7 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
 }
 
 function stripToolCallText(text: string): string {
+  text = normalizeDsmlText(text);
   return text
     // DSML V4: <｜DSML｜tool_calls>...</｜DSML｜tool_calls> (full-width or ASCII pipe)
     .replace(/<[｜|]?DSML[｜|]tool_calls>[\s\S]*?<\/[｜|]?DSML[｜|]tool_calls>/g, "")
