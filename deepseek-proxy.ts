@@ -559,66 +559,106 @@ function solvePoW(challenge: string, salt: string, difficulty: number, expireAt:
 // ─── VPS Cache Client ────────────────────────────────────────────────────────
 // Pre-solved PoW + session pool from persistent VPS nodes.
 // Falls back gracefully to on-demand if VPS is unavailable.
-const DS_CACHE_URL = process.env.DS_CACHE_URL || process.env.VPS_PROXY_URL?.replace(":3080", ":3081") || "";
+// Both VPS nodes run ds-cache on port 3081. Try both with failover.
+const DS_CACHE_NODES = (process.env.DS_CACHE_URLS || "").split(",").filter(Boolean);
+if (DS_CACHE_NODES.length === 0 && process.env.VPS_PROXY_URL) {
+  // Derive from VPS_PROXY_URL (Node 1) — also add Node 2 if known
+  DS_CACHE_NODES.push(process.env.VPS_PROXY_URL.replace(":3080", ":3081"));
+  // Add Node 2 hardcoded (both VPS nodes run identical services)
+  if (!DS_CACHE_NODES[0].includes("107.172.252.126")) {
+    DS_CACHE_NODES.push("http://107.172.252.126:3081");
+  }
+}
 const DS_CACHE_SECRET = process.env.SMTP_PROXY_SECRET || "";
+let _dsCacheNodeIdx = 0; // round-robin index
+
+/** Get next VPS cache URL with round-robin + failover */
+function getDsCacheUrl(): string {
+  if (DS_CACHE_NODES.length === 0) return "";
+  const url = DS_CACHE_NODES[_dsCacheNodeIdx % DS_CACHE_NODES.length];
+  _dsCacheNodeIdx++;
+  return url;
+}
+
+/** Try a VPS cache request with failover across nodes */
+async function vpsCacheFetch(path: string, options?: RequestInit): Promise<Response | null> {
+  if (DS_CACHE_NODES.length === 0) return null;
+  // Try each node starting from round-robin position
+  const startIdx = _dsCacheNodeIdx;
+  for (let i = 0; i < DS_CACHE_NODES.length; i++) {
+    const nodeUrl = DS_CACHE_NODES[(startIdx + i) % DS_CACHE_NODES.length];
+    try {
+      const res = await fetch(`${nodeUrl}${path}`, {
+        ...options,
+        headers: { ...options?.headers as any, "x-ds-cache-secret": DS_CACHE_SECRET },
+        signal: AbortSignal.timeout(3000),
+      });
+      if (res.ok) {
+        _dsCacheNodeIdx = (startIdx + i + 1) % DS_CACHE_NODES.length; // advance for next call
+        return res;
+      }
+    } catch {
+      // Node unreachable — try next
+    }
+  }
+  return null; // All nodes failed
+}
 
 async function getVpsPow(token: string, path: string): Promise<string | null> {
-  if (!DS_CACHE_URL) return null;
-  try {
-    const res = await fetch(`${DS_CACHE_URL}/pow?token=${encodeURIComponent(token)}&path=${encodeURIComponent(path)}`, {
-      headers: { "x-ds-cache-secret": DS_CACHE_SECRET },
-      signal: AbortSignal.timeout(3000), // 3s max — don't block longer than solving locally
-    });
-    if (!res.ok) return null;
-    const data = await res.json() as any;
-    if (data.pow) {
-      console.log(`[ds-proxy] [vps-cache] PoW ${data.hit ? "HIT" : "solved-on-vps"} for ${path}`);
-      return data.pow;
-    }
-    return null;
-  } catch {
-    return null; // VPS unreachable — fall back to local solve
+  const res = await vpsCacheFetch(`/pow?token=${encodeURIComponent(token)}&path=${encodeURIComponent(path)}`);
+  if (!res) return null;
+  const data = await res.json() as any;
+  if (data.pow) {
+    console.log(`[ds-proxy] [vps-cache] PoW ${data.hit ? "HIT" : "solved-on-vps"} for ${path}`);
+    return data.pow;
   }
+  return null;
 }
 
 async function getVpsSession(token: string): Promise<string | null> {
-  if (!DS_CACHE_URL) return null;
-  try {
-    const res = await fetch(`${DS_CACHE_URL}/session?token=${encodeURIComponent(token)}`, {
-      headers: { "x-ds-cache-secret": DS_CACHE_SECRET },
-      signal: AbortSignal.timeout(3000),
-    });
-    if (!res.ok) return null;
-    const data = await res.json() as any;
-    if (data.sessionId) {
-      console.log(`[ds-proxy] [vps-cache] session ${data.hit ? "HIT" : "created-on-vps"} (${data.sessionId.slice(0, 8)}...)`);
-      return data.sessionId;
-    }
-    return null;
-  } catch {
-    return null;
+  const res = await vpsCacheFetch(`/session?token=${encodeURIComponent(token)}`);
+  if (!res) return null;
+  const data = await res.json() as any;
+  if (data.sessionId) {
+    console.log(`[ds-proxy] [vps-cache] session ${data.hit ? "HIT" : "created-on-vps"} (${data.sessionId.slice(0, 8)}...)`);
+    return data.sessionId;
   }
+  return null;
 }
 
-/** Push current account tokens to VPS cache so it can pre-solve */
+/** Push current account tokens to ALL VPS cache nodes so they can pre-solve */
 async function syncAccountsToVpsCache(): Promise<void> {
-  if (!DS_CACHE_URL) return;
+  if (DS_CACHE_NODES.length === 0) return;
   const activeAccounts = pool
     .filter(a => a.status === "active" && a.token)
     .map(a => ({ token: a.token, email: a.email }));
   if (activeAccounts.length === 0) return;
-  try {
-    await fetch(`${DS_CACHE_URL}/accounts`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-ds-cache-secret": DS_CACHE_SECRET },
-      body: JSON.stringify({ accounts: activeAccounts }),
-      signal: AbortSignal.timeout(5000),
-    });
-    console.log(`[ds-proxy] [vps-cache] synced ${activeAccounts.length} accounts to VPS cache`);
-  } catch (e: any) {
-    console.warn(`[ds-proxy] [vps-cache] sync failed: ${e.message}`);
+  const body = JSON.stringify({ accounts: activeAccounts });
+  let synced = 0;
+  for (const nodeUrl of DS_CACHE_NODES) {
+    try {
+      await fetch(`${nodeUrl}/accounts`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-ds-cache-secret": DS_CACHE_SECRET },
+        body,
+        signal: AbortSignal.timeout(5000),
+      });
+      synced++;
+    } catch (e: any) {
+      console.warn(`[ds-proxy] [vps-cache] sync to ${nodeUrl} failed: ${e.message}`);
+    }
+  }
+  if (synced > 0) {
+    console.log(`[ds-proxy] [vps-cache] synced ${activeAccounts.length} accounts to ${synced}/${DS_CACHE_NODES.length} VPS nodes`);
   }
 }
+
+// ── Periodic VPS cache sync (every 5 min) ─────────────────────────────────
+// Ensures accounts stay synced even if the initial sync failed (e.g. port
+// wasn't open yet) or if accounts changed (token refresh, new accounts).
+setInterval(() => { syncAccountsToVpsCache().catch(() => {}); }, 5 * 60 * 1000);
+// Also sync 10 seconds after startup (gives pool time to load from SmartAssist)
+setTimeout(() => { syncAccountsToVpsCache().catch(() => {}); }, 10_000);
 
 // ─── PoW challenge fetch + solve ─────────────────────────────────────────────
 async function getPowResponse(targetPath: string, token: string): Promise<string | null> {
