@@ -1858,6 +1858,82 @@ Bun.serve({
       });
     }
 
+    // ── Parallel batch completions ──────────────────────────────────────────
+    // POST /v1/chat/completions/batch — execute multiple LLM calls in parallel
+    // across different accounts. Each request gets its own account from the pool.
+    // Use case: sub-agent spawning, parallel NL-to-SQL, multi-query research.
+    //
+    // Body: { requests: [{ messages, tools?, ... }, ...] }
+    // Response: { results: [{ response, account, ms }, ...] }
+    if (url.pathname === "/v1/chat/completions/batch" && req.method === "POST") {
+      const body = await req.json() as any;
+      const requests: any[] = body.requests || [];
+      if (!requests.length) return Response.json({ error: "requests array required" }, { status: 400 });
+
+      console.log(`[ds-proxy] [${rid}] batch: ${requests.length} parallel requests`);
+
+      const results = await Promise.allSettled(
+        requests.map(async (reqBody: any, i: number) => {
+          const acc = pickAccount();
+          if (!acc) throw new Error("No active accounts");
+          acc.lastUsed = Date.now();
+          recordRequest(acc);
+
+          const subRid = `${rid}-batch-${i}`;
+          try {
+            const result = await doCompletion({ ...reqBody, _rid: subRid, stream: false }, acc, subRid);
+            if (!result.upstream.ok) {
+              const text = await result.upstream.text();
+              return { error: text, account: acc.email, ms: Date.now() };
+            }
+            const data = await result.upstream.json() as any;
+            // Parse tool calls from text if present
+            const content = data?.choices?.[0]?.message?.content || "";
+            const toolCalls = extractToolCallsFromText(content, subRid);
+            const cleanContent = stripToolCallText(content).trim();
+
+            return {
+              response: {
+                ...data,
+                choices: [{
+                  ...data.choices?.[0],
+                  message: {
+                    role: "assistant",
+                    content: cleanContent || null,
+                    ...(toolCalls.length ? {
+                      tool_calls: toolCalls.map((tc, j) => ({
+                        id: `call_${Date.now()}_${i}_${j}`,
+                        type: "function",
+                        function: { name: tc.name, arguments: JSON.stringify(tc.input) },
+                      })),
+                    } : {}),
+                  },
+                  finish_reason: toolCalls.length ? "tool_calls" : "stop",
+                }],
+              },
+              account: acc.email,
+              ms: Date.now(),
+            };
+          } catch (err: any) {
+            if (acc.password && (err.message?.includes("Session create failed") || err.message?.includes("40003"))) {
+              expireAccount(acc);
+            } else {
+              coolAccount(acc);
+            }
+            return { error: err.message, account: acc.email, ms: Date.now() };
+          }
+        })
+      );
+
+      const output = results.map((r, i) => {
+        if (r.status === "fulfilled") return r.value;
+        return { error: r.reason?.message || "Unknown error", index: i };
+      });
+
+      console.log(`[ds-proxy] [${rid}] batch done: ${results.filter(r => r.status === "fulfilled").length}/${requests.length} succeeded`);
+      return Response.json({ results: output });
+    }
+
     // ── Models ────────────────────────────────────────────────────────────────
     if (url.pathname === "/v1/models") {
       return Response.json({
