@@ -22,8 +22,14 @@
 import { execFileSync } from "child_process";
 import { createHmac, randomUUID, timingSafeEqual } from "crypto";
 
-// Session ID — generated once at proxy startup, mirrors X-Claude-Code-Session-Id behaviour
-const PROXY_SESSION_ID = randomUUID();
+// Session ID — generated per logical conversation, not once globally.
+// Real Claude Code generates a new UUID each time a terminal opens.
+// One fixed UUID across thousands of requests over days is an anomalous telemetry
+// pattern. Callers may pass X-Conversation-Id to group their turns under one
+// session; otherwise each request gets its own fresh UUID.
+function getSessionId(req: Request): string {
+  return req.headers.get("x-conversation-id") || randomUUID();
+}
 
 const PORT = process.env.PROXY_PORT ? parseInt(process.env.PROXY_PORT) : 3099;
 const ANTHROPIC_API = "https://api.anthropic.com";
@@ -31,6 +37,15 @@ const ANTHROPIC_VERSION = "2023-06-01";
 const OAUTH_BETA = "oauth-2025-04-20";
 const PROXY_VERSION = "2.1.45";
 const CLI_USER_AGENT = `claude-cli/${PROXY_VERSION} (user, cli)`;
+
+// ─── Context optimisation feature flags ──────────────────────────────────────
+// PROXY_COMPACT_THRESHOLD=150000  — token count that triggers server-side compaction
+//                                   set to 0 to disable compaction entirely
+// PROXY_TOOL_CACHE=true           — add cache_control to last tool definition
+// PROXY_STRIP_TOOLS_WHEN_NONE=true — omit tools[] entirely when tool_choice is none
+const COMPACT_THRESHOLD  = parseInt(process.env.PROXY_COMPACT_THRESHOLD ?? "150000", 10);
+const TOOL_CACHE_ENABLED = (process.env.PROXY_TOOL_CACHE ?? "true") !== "false";
+const STRIP_TOOLS_NONE   = (process.env.PROXY_STRIP_TOOLS_WHEN_NONE ?? "true") !== "false";
 
 // ─── xxHash64 — pure TypeScript, no deps ─────────────────────────────────────
 // Used to compute the cch attestation value that Anthropic's API requires for
@@ -235,6 +250,221 @@ const AUTH_FAILURE_ALERT_THRESHOLD = 3;
 let _fallbackActive = false;
 let _fallbackCount = 0;
 let _fallbackSince: string | null = null;
+
+// ─── Unified rate limit state (subscription OAuth) ───────────────────────────
+// Anthropic subscription OAuth calls use the unified limiter, NOT the standard
+// anthropic-ratelimit-requests-* / tokens-* headers. These are the real headers.
+interface UnifiedRlState {
+  status: string | null;                  // allowed | allowed_warning | rejected
+  claim: string | null;                   // five_hour | seven_day | seven_day_opus | seven_day_sonnet | overage
+  fallbackAvailable: boolean;
+  fiveHour: { utilization: number | null; resetsAt: string | null; surpassed: string | null };
+  sevenDay: { utilization: number | null; resetsAt: string | null; surpassed: string | null };
+  overage: { status: string | null; resetsAt: string | null; disabledReason: string | null };
+  total429s: number;
+  lastUpdated: string | null;
+  lastModel: string | null;
+}
+
+let _unifiedRl: UnifiedRlState = {
+  status: null,
+  claim: null,
+  fallbackAvailable: false,
+  fiveHour: { utilization: null, resetsAt: null, surpassed: null },
+  sevenDay: { utilization: null, resetsAt: null, surpassed: null },
+  overage: { status: null, resetsAt: null, disabledReason: null },
+  total429s: 0,
+  lastUpdated: null,
+  lastModel: null,
+};
+
+// ─── Persistent token ledger ─────────────────────────────────────────────────
+// Tracks every token we process ourselves — independent of Anthropic headers.
+// Persisted to disk so proxy restarts don't lose history.
+// Rolling window entries let us compute our own 5h/7d usage totals.
+
+const STATS_FILE = process.env.PROXY_STATS_FILE || "/tmp/proxy-stats.json";
+const FIVE_HOURS_MS  = 5 * 60 * 60 * 1000;
+const SEVEN_DAYS_MS  = 7 * 24 * 60 * 60 * 1000;
+// Keep at most 7 days of window entries (one per request, trimmed on save)
+const WINDOW_MAX_AGE_MS = SEVEN_DAYS_MS;
+
+interface ModelStats {
+  requests: number;
+  tokensIn: number;
+  tokensOut: number;
+  last429At: string | null;
+}
+
+interface WindowEntry {
+  ts: number;   // unix ms
+  model: string;
+  tokensIn: number;
+  tokensOut: number;
+}
+
+interface PersistentStats {
+  since: string;
+  totals: { requests: number; tokensIn: number; tokensOut: number; total429s: number };
+  byModel: Record<string, ModelStats>;
+  window: WindowEntry[];
+}
+
+let _stats: PersistentStats = {
+  since: new Date().toISOString(),
+  totals: { requests: 0, tokensIn: 0, tokensOut: 0, total429s: 0 },
+  byModel: {},
+  window: [],
+};
+
+// Load persisted stats from disk at startup
+function loadStats(): void {
+  try {
+    const { readFileSync } = require("fs") as typeof import("fs");
+    const raw = readFileSync(STATS_FILE, "utf8");
+    const parsed = JSON.parse(raw) as PersistentStats;
+    // Trim stale window entries on load
+    const cutoff = Date.now() - WINDOW_MAX_AGE_MS;
+    parsed.window = (parsed.window || []).filter(e => e.ts >= cutoff);
+    _stats = parsed;
+    console.log(`[proxy] Stats loaded from ${STATS_FILE} | since=${_stats.since} | requests=${_stats.totals.requests} | tokensIn=${_stats.totals.tokensIn} | tokensOut=${_stats.totals.tokensOut}`);
+  } catch {
+    console.log(`[proxy] No existing stats file at ${STATS_FILE} — starting fresh`);
+  }
+}
+
+// Save stats to disk (called after every recorded request)
+let _savePending = false;
+function saveStats(): void {
+  if (_savePending) return;
+  _savePending = true;
+  // Defer to next tick so rapid bursts don't hammer disk
+  setImmediate(() => {
+    _savePending = false;
+    try {
+      const { writeFileSync } = require("fs") as typeof import("fs");
+      // Trim window before saving
+      const cutoff = Date.now() - WINDOW_MAX_AGE_MS;
+      _stats.window = _stats.window.filter(e => e.ts >= cutoff);
+      writeFileSync(STATS_FILE, JSON.stringify(_stats, null, 2), "utf8");
+    } catch (err) {
+      console.warn("[proxy] Failed to save stats:", err);
+    }
+  });
+}
+
+function recordUsage(model: string, tokensIn: number, tokensOut: number): void {
+  const now = Date.now();
+  _stats.totals.requests++;
+  _stats.totals.tokensIn  += tokensIn;
+  _stats.totals.tokensOut += tokensOut;
+
+  if (!_stats.byModel[model]) {
+    _stats.byModel[model] = { requests: 0, tokensIn: 0, tokensOut: 0, last429At: null };
+  }
+  _stats.byModel[model].requests++;
+  _stats.byModel[model].tokensIn  += tokensIn;
+  _stats.byModel[model].tokensOut += tokensOut;
+
+  _stats.window.push({ ts: now, model, tokensIn, tokensOut });
+  saveStats();
+}
+
+function record429(model: string): void {
+  _stats.totals.total429s++;
+  _unifiedRl.total429s++;
+  if (_stats.byModel[model]) {
+    _stats.byModel[model].last429At = new Date().toISOString();
+  }
+  saveStats();
+}
+
+function computeRollingWindow(windowMs: number): { requests: number; tokensIn: number; tokensOut: number; byModel: Record<string, { requests: number; tokensIn: number; tokensOut: number }> } {
+  const cutoff = Date.now() - windowMs;
+  const entries = _stats.window.filter(e => e.ts >= cutoff);
+  const byModel: Record<string, { requests: number; tokensIn: number; tokensOut: number }> = {};
+  let tokensIn = 0, tokensOut = 0;
+  for (const e of entries) {
+    tokensIn  += e.tokensIn;
+    tokensOut += e.tokensOut;
+    if (!byModel[e.model]) byModel[e.model] = { requests: 0, tokensIn: 0, tokensOut: 0 };
+    byModel[e.model].requests++;
+    byModel[e.model].tokensIn  += e.tokensIn;
+    byModel[e.model].tokensOut += e.tokensOut;
+  }
+  return { requests: entries.length, tokensIn, tokensOut, byModel };
+}
+
+
+function extractUnifiedRl(headers: Headers, model: string): void {
+  const status         = headers.get("anthropic-ratelimit-unified-status");
+  const claim          = headers.get("anthropic-ratelimit-unified-representative-claim");
+  const fallback       = headers.get("anthropic-ratelimit-unified-fallback");
+  const fiveUtil       = headers.get("anthropic-ratelimit-unified-5h-utilization");
+  const fiveReset      = headers.get("anthropic-ratelimit-unified-5h-reset");
+  const fiveSurpassed  = headers.get("anthropic-ratelimit-unified-5h-surpassed-threshold");
+  const sevenUtil      = headers.get("anthropic-ratelimit-unified-7d-utilization");
+  const sevenReset     = headers.get("anthropic-ratelimit-unified-7d-reset");
+  const sevenSurpassed = headers.get("anthropic-ratelimit-unified-7d-surpassed-threshold");
+  const overageStatus  = headers.get("anthropic-ratelimit-unified-overage-status");
+  const overageReset   = headers.get("anthropic-ratelimit-unified-overage-reset");
+  const overageReason  = headers.get("anthropic-ratelimit-unified-overage-disabled-reason");
+
+  // Only update if any unified header is present
+  if (!status && !fiveUtil && !sevenUtil) return;
+
+  _unifiedRl = {
+    status,
+    claim,
+    fallbackAvailable: fallback === "available",
+    fiveHour: {
+      utilization: fiveUtil !== null ? Number(fiveUtil) : _unifiedRl.fiveHour.utilization,
+      resetsAt: fiveReset
+        ? new Date(Number(fiveReset) * 1000).toISOString()
+        : _unifiedRl.fiveHour.resetsAt,
+      surpassed: fiveSurpassed,
+    },
+    sevenDay: {
+      utilization: sevenUtil !== null ? Number(sevenUtil) : _unifiedRl.sevenDay.utilization,
+      resetsAt: sevenReset
+        ? new Date(Number(sevenReset) * 1000).toISOString()
+        : _unifiedRl.sevenDay.resetsAt,
+      surpassed: sevenSurpassed,
+    },
+    overage: {
+      status: overageStatus,
+      resetsAt: overageReset
+        ? new Date(Number(overageReset) * 1000).toISOString()
+        : _unifiedRl.overage.resetsAt,
+      disabledReason: overageReason,
+    },
+    total429s: _unifiedRl.total429s,
+    lastUpdated: new Date().toISOString(),
+    lastModel: model,
+  };
+
+  // Log a concise unified RL line
+  const fivePct = _unifiedRl.fiveHour.utilization !== null
+    ? `${(_unifiedRl.fiveHour.utilization * 100).toFixed(1)}%`
+    : "?";
+  const sevenPct = _unifiedRl.sevenDay.utilization !== null
+    ? `${(_unifiedRl.sevenDay.utilization * 100).toFixed(1)}%`
+    : "?";
+  console.log(
+    `[proxy] UNI status=${status ?? "?"} claim=${claim ?? "?"} 5h=${fivePct}(rst=${_unifiedRl.fiveHour.resetsAt ?? "?"}) 7d=${sevenPct}(rst=${_unifiedRl.sevenDay.resetsAt ?? "?"}) overage=${overageStatus ?? "none"} fallback=${fallback ?? "none"}`
+  );
+
+  // Warn when approaching limits
+  if (_unifiedRl.fiveHour.utilization !== null && _unifiedRl.fiveHour.utilization >= 0.8) {
+    console.warn(`[proxy] ⚠ HIGH 5h utilization ${fivePct} | resets ${_unifiedRl.fiveHour.resetsAt}`);
+  }
+  if (_unifiedRl.sevenDay.utilization !== null && _unifiedRl.sevenDay.utilization >= 0.75) {
+    console.warn(`[proxy] ⚠ HIGH 7d utilization ${sevenPct} | resets ${_unifiedRl.sevenDay.resetsAt}`);
+  }
+  if (status === "rejected") {
+    console.error(`[proxy] ✗ UNIFIED REJECTED claim=${claim} overage=${overageStatus} reason=${overageReason ?? "none"}`);
+  }
+}
 
 // Gap fix #6: runtime Secret Manager cache — populated at startup and after each refresh.
 // Avoids relying on env vars baked into the container image at deploy time.
@@ -678,11 +908,6 @@ function convertOpenAIToAnthropic(body: any): any {
     hasCacheControl ? systemBlocks :
     systemBlocks.map((b: any) => b.text).join("\n\n");
 
-  // Convert tools
-  const tools = (body.tools || [])
-    .map(convertOAIToolToAnthropic)
-    .filter(Boolean);
-
   // tool_choice conversion
   let tool_choice: any = undefined;
   if (body.tool_choice) {
@@ -690,6 +915,29 @@ function convertOpenAIToAnthropic(body: any): any {
     else if (body.tool_choice === "none") tool_choice = { type: "none" };
     else if (body.tool_choice === "required") tool_choice = { type: "any" };
     else if (body.tool_choice?.function?.name) tool_choice = { type: "tool", name: body.tool_choice.function.name };
+  }
+
+  // Convert tools — with two optimisations:
+  //
+  // 1. Strip entirely when tool_choice is "none": sending tool definitions with
+  //    tool_choice:none still costs full token price for every schema. The only
+  //    way to pay 0 tool tokens is to omit the tools array completely.
+  //
+  // 2. Prompt-cache the tool definitions: adding cache_control to the last tool
+  //    causes Anthropic to cache all tools as a single prefix block. Subsequent
+  //    requests within the 5-min TTL pay 0.1x instead of full input token price.
+  //    Cache write = 1.25x on first request; cache read = 0.1x thereafter.
+  const isToolChoiceNone = body.tool_choice === "none" || tool_choice?.type === "none";
+  let tools: any[] = [];
+  if (!(STRIP_TOOLS_NONE && isToolChoiceNone)) {
+    tools = (body.tools || []).map(convertOAIToolToAnthropic).filter(Boolean);
+    // Add cache_control to the last tool — caches the entire tools[] prefix
+    if (TOOL_CACHE_ENABLED && tools.length > 0) {
+      tools[tools.length - 1] = {
+        ...tools[tools.length - 1],
+        cache_control: { type: "ephemeral" },
+      };
+    }
   }
 
   return {
@@ -805,7 +1053,10 @@ async function fetchWithRetry(
     const rlReqRemaining = res.headers.get("anthropic-ratelimit-requests-remaining");
     const rawWaitMs = retryAfter ? parseInt(retryAfter) * 1000 : (1000 * Math.pow(2, i));
     const waitMs = Math.min(rawWaitMs, 30_000); // cap 30s — fake retry-after from cch failures can be 220000+
-    console.warn(`[proxy] ⚠ 429 retry-after=${retryAfter ?? "none"} tok_remaining=${rlTokRemaining ?? "?"} req_remaining=${rlReqRemaining ?? "?"} | waiting ${waitMs}ms (attempt ${i + 1}/${maxAttempts})`);
+    _stats.totals.total429s++;
+    _unifiedRl.total429s = _stats.totals.total429s;
+    saveStats();
+    console.warn(`[proxy] ⚠ 429 retry-after=${retryAfter ?? "none"} tok_remaining=${rlTokRemaining ?? "?"} req_remaining=${rlReqRemaining ?? "?"} | waiting ${waitMs}ms (attempt ${i + 1}/${maxAttempts}) | total429s=${_stats.totals.total429s}`);
     await sleep(waitMs);
 
     // Re-fetch fresh token on retry (may have been refreshed)
@@ -1039,6 +1290,9 @@ async function callViaBinary(body: any, mappedModel: string, originalModel: stri
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
+// Load persistent token ledger from disk
+loadStats();
+
 // Gap fix #6: read tokens from Secret Manager at startup so cold starts are self-sufficient
 if (GCP_PROJECT) {
   console.log("[proxy] Reading tokens from Secret Manager at startup...");
@@ -1071,6 +1325,35 @@ const server = Bun.serve({
           active: _fallbackActive,
           count: _fallbackCount,
           since: _fallbackSince,
+        },
+        rateLimits: {
+          status: _unifiedRl.status,
+          claim: _unifiedRl.claim,
+          fallbackAvailable: _unifiedRl.fallbackAvailable,
+          fiveHour: {
+            utilizationPct: _unifiedRl.fiveHour.utilization !== null
+              ? `${(_unifiedRl.fiveHour.utilization * 100).toFixed(1)}%`
+              : null,
+            resetsAt: _unifiedRl.fiveHour.resetsAt,
+            warningFired: _unifiedRl.fiveHour.surpassed !== null,
+          },
+          sevenDay: {
+            utilizationPct: _unifiedRl.sevenDay.utilization !== null
+              ? `${(_unifiedRl.sevenDay.utilization * 100).toFixed(1)}%`
+              : null,
+            resetsAt: _unifiedRl.sevenDay.resetsAt,
+            warningFired: _unifiedRl.sevenDay.surpassed !== null,
+          },
+          overage: _unifiedRl.overage,
+          total429s: _unifiedRl.total429s,
+          lastUpdated: _unifiedRl.lastUpdated,
+          lastModel: _unifiedRl.lastModel,
+        },
+        counters: {
+          totalRequests: _stats.totals.requests,
+          totalTokensIn: _stats.totals.tokensIn,
+          totalTokensOut: _stats.totals.tokensOut,
+          since: _stats.since,
         },
       });
     }
@@ -1212,6 +1495,45 @@ const server = Bun.serve({
       return Response.json({ results, query });
     }
 
+    // ─── /stats — our own independent token ledger ───────────────────────────
+    if (url.pathname === "/stats") {
+      const fiveHourWindow = computeRollingWindow(FIVE_HOURS_MS);
+      const sevenDayWindow = computeRollingWindow(SEVEN_DAYS_MS);
+
+      // Cross-check: compare our 5h/7d window totals against Anthropic's utilization
+      // (Anthropic reports 0-1 fraction; we report raw tokens — complementary views)
+      return Response.json({
+        since: _stats.since,
+        totals: _stats.totals,
+        byModel: _stats.byModel,
+        rolling: {
+          fiveHour: {
+            window: "5h",
+            ...fiveHourWindow,
+            anthropicUtilization: _unifiedRl.fiveHour.utilization !== null
+              ? `${(_unifiedRl.fiveHour.utilization * 100).toFixed(1)}%`
+              : "unknown (no unified header seen yet)",
+            anthropicResetsAt: _unifiedRl.fiveHour.resetsAt,
+          },
+          sevenDay: {
+            window: "7d",
+            ...sevenDayWindow,
+            anthropicUtilization: _unifiedRl.sevenDay.utilization !== null
+              ? `${(_unifiedRl.sevenDay.utilization * 100).toFixed(1)}%`
+              : "unknown (no unified header seen yet)",
+            anthropicResetsAt: _unifiedRl.sevenDay.resetsAt,
+          },
+        },
+        anthropicRateLimits: {
+          status: _unifiedRl.status,
+          claim: _unifiedRl.claim,
+          fallbackAvailable: _unifiedRl.fallbackAvailable,
+          overage: _unifiedRl.overage,
+          lastUpdated: _unifiedRl.lastUpdated,
+        },
+      });
+    }
+
     if (url.pathname === "/v1/models") {
       return Response.json({
         object: "list",
@@ -1296,7 +1618,41 @@ const server = Bun.serve({
       } else {
         systemWithBilling = [billingBlockPlaceholder];
       }
-      const bodyWithPlaceholder = { ...anthropicBody, system: systemWithBilling };
+      // ── Context management — compaction + tool result clearing ──────────────
+      // Server-side compaction: when input tokens exceed COMPACT_THRESHOLD,
+      // Anthropic generates a summary, inserts a compaction block, and drops all
+      // prior messages on subsequent requests. Measured 85% token reduction.
+      //
+      // Tool result clearing: clears oldest tool_result blocks with placeholders
+      // when context grows large, preserving conversation structure without
+      // accumulating stale tool outputs. Better than full compaction for agentic flows.
+      // Haiku 4.5 doesn't support compact_20260112 or context management features
+      // (released Oct 2025, before these betas). Skip for haiku models.
+      const isHaiku = /haiku/i.test(anthropicBody.model || "");
+      const contextManagementEdits: any[] = [];
+      if (COMPACT_THRESHOLD > 0 && !isHaiku) {
+        contextManagementEdits.push({
+          type: "compact_20260112",
+          trigger: { type: "input_tokens", value: COMPACT_THRESHOLD },
+          pause_after_compaction: false,
+        });
+      }
+      // Tool result clearing — skip for haiku (same beta requirement)
+      if (!isHaiku) {
+        contextManagementEdits.push({
+          type: "clear_tool_uses_20250919",
+          trigger: { type: "input_tokens", value: Math.round(COMPACT_THRESHOLD * 0.7) || 100000 },
+          clear_tool_inputs: false,
+        });
+      }
+
+      const bodyWithPlaceholder = {
+        ...anthropicBody,
+        system: systemWithBilling,
+        ...(contextManagementEdits.length > 0 && {
+          context_management: { edits: contextManagementEdits },
+        }),
+      };
       const placeholderStr = JSON.stringify(bodyWithPlaceholder);
       const placeholderBytes = new TextEncoder().encode(placeholderStr);
 
@@ -1308,22 +1664,40 @@ const server = Bun.serve({
       const bodyStr = placeholderStr.replace("cch=00000", `cch=${cch}`);
 
       const billingStr = placeholderBillingStr.replace("cch=00000", `cch=${cch}`);
-      console.log(`[proxy] CCH cch=${cch} body_len=${bodyStr.length} placeholder_len=${placeholderStr.length} has_tools=${!!(anthropicBody as any).tools?.length} model=${anthropicBody.model}`);
+      const toolCount = (anthropicBody as any).tools?.length ?? 0;
+      const toolsStripped = STRIP_TOOLS_NONE && body.tool_choice === "none" && (body.tools?.length ?? 0) > 0;
+      console.log(`[proxy] CCH cch=${cch} body_len=${bodyStr.length} tools=${toolCount}${toolsStripped ? "(stripped-none)" : toolCount > 0 && TOOL_CACHE_ENABLED ? "(cached)" : ""} compact=${COMPACT_THRESHOLD > 0 ? COMPACT_THRESHOLD : "off"} model=${anthropicBody.model}`);
       console.log(`[proxy] BILLING_BLOCK "${billingStr}"`);
       console.log(`[proxy] BODY_PREVIEW ${bodyStr.slice(0, 800)}`);
 
       const clientRequestId = randomUUID();
+      const sessionId = getSessionId(req);
+
+      // Beta flags:
+      //   oauth-2025-04-20              — subscription OAuth auth
+      //   prompt-caching-2024-07-31     — system prompt + tool definition caching
+      //   claude-code-20250219          — core agentic/tool-use mode (required for subscription routing)
+      //   compact-2026-01-12            — server-side conversation compaction
+      //   context-management-2025-06-27 — surgical tool result clearing
+      const betaFlags = [
+        OAUTH_BETA,
+        "prompt-caching-2024-07-31",
+        "claude-code-20250219",
+        ...(COMPACT_THRESHOLD > 0 && !isHaiku ? ["compact-2026-01-12"] : []),
+        ...(isHaiku ? [] : ["context-management-2025-06-27"]),
+      ].join(",");
+
       const headers = {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
         "anthropic-version": ANTHROPIC_VERSION,
-        "anthropic-beta": `${OAUTH_BETA},prompt-caching-2024-07-31,claude-code-20250219`,
+        "anthropic-beta": betaFlags,
         "x-app": "cli",
         "User-Agent": CLI_USER_AGENT,
-        "X-Claude-Code-Session-Id": PROXY_SESSION_ID,
+        "X-Claude-Code-Session-Id": sessionId,
         "x-client-request-id": clientRequestId,
       };
-      console.log(`[proxy] HEADERS anthropic-version=${ANTHROPIC_VERSION} beta=${OAUTH_BETA},prompt-caching-2024-07-31,claude-code-20250219 x-app=cli session=${PROXY_SESSION_ID} req-id=${clientRequestId}`);
+      console.log(`[proxy] HEADERS session=${sessionId} req-id=${clientRequestId} beta=${betaFlags}`);
 
       // Gap fix #5: concurrency limiter — 3-tier priority.
       // Foreground: no semaphore (pass-through like Claude Code terminals).
@@ -1411,6 +1785,9 @@ const server = Bun.serve({
       _fallbackCount = 0;
       _fallbackSince = null;
 
+      // Extract unified subscription rate limit headers on every successful response
+      extractUnifiedRl(upstream.headers, anthropicBody.model);
+
       // Streaming
       if (body.stream) {
         const stream = new ReadableStream({
@@ -1493,6 +1870,7 @@ const server = Bun.serve({
 
                   else if (event.type === "message_stop") {
                     const totalMs = Date.now() - reqStart;
+                    recordUsage(anthropicBody.model, streamUsage.input_tokens || 0, streamUsage.output_tokens || 0);
                     console.log(`[proxy] ✓ stream ${reqLabel} | ${totalMs}ms | in=${streamUsage.input_tokens ?? "?"} out=${streamUsage.output_tokens ?? "?"}`);
                     emit(baseChunk({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }));
                     controller.enqueue(enc.encode("data: [DONE]\n\n"));
@@ -1517,8 +1895,15 @@ const server = Bun.serve({
       const anthropicResponse = await upstream.json() as any;
       const usage = anthropicResponse?.usage;
       if (usage) {
-        console.log(`[proxy] ✓ ${reqLabel} | ${upstreamMs}ms | in=${usage.input_tokens} out=${usage.output_tokens} cache_read=${usage.cache_read_input_tokens ?? 0} cache_write=${usage.cache_creation_input_tokens ?? 0}`);
+        recordUsage(anthropicBody.model, usage.input_tokens || 0, usage.output_tokens || 0);
+        const cacheRead  = usage.cache_read_input_tokens ?? 0;
+        const cacheWrite = usage.cache_creation_input_tokens ?? 0;
+        const cacheSavedPct = usage.input_tokens > 0
+          ? ((cacheRead / (usage.input_tokens + cacheRead)) * 100).toFixed(1)
+          : "0.0";
+        console.log(`[proxy] ✓ ${reqLabel} | ${upstreamMs}ms | in=${usage.input_tokens} out=${usage.output_tokens} cache_read=${cacheRead} cache_write=${cacheWrite} cache_saved=${cacheSavedPct}%`);
       } else {
+        recordUsage(anthropicBody.model, 0, 0);
         console.log(`[proxy] ✓ ${reqLabel} | ${upstreamMs}ms`);
       }
       const openAIResponse = convertAnthropicToOpenAI(anthropicResponse, originalModel);
