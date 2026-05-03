@@ -922,10 +922,15 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
   //
   // Preamble (OUTPUT INTEGRITY GUARD, ## Tools) is joined before the conversation.
 
-  const EOS = "<｜end▁of▁sentence｜>";
-  const BOS = "<｜begin▁of▁sentence｜>";
-  const USER_TOKEN = "<｜User｜>";
-  const ASST_OPEN = "<｜Assistant｜></think>"; // chat mode: </think> closes thinking immediately
+  // Role labels for conversation structure.
+  // NOTE: V4 special tokens (<｜User｜>, <｜Assistant｜>, BOS, EOS) cause the DeepSeek
+  // web API to return empty responses — the web endpoint blocks prompts containing
+  // the model's own special tokens (treated as prompt injection). These plain-text
+  // labels are understood by the model from pre-training data and work correctly
+  // with the web API endpoint. DSML tool call tokens (<｜DSML｜invoke> etc.) are safe
+  // because they only appear in the model's OUTPUT, not injected into the prompt context.
+  const USER_TOKEN = "[USER]\n";
+  const ASST_OPEN = "\n\n[ASSISTANT]\n";
 
   function extractText(msg: any): string {
     return typeof msg.content === "string"
@@ -961,13 +966,12 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
   if (offloadedFileId) {
     const preamble = parts.join("\n\n");
     const prompt =
-      BOS + preamble + "\n\n" +
-      USER_TOKEN +
+      preamble + "\n\n" +
+      "[USER]\n" +
       "Review the attached DS2API_HISTORY.txt which contains the conversation so far. " +
       "Answer the latest user request. If you need fresh data that is not already in the history, " +
       "call the appropriate tool — do not fabricate or guess values. " +
-      "Never invent names, IDs, counts, or any other data." +
-      ASST_OPEN;
+      "Never invent names, IDs, counts, or any other data.";
     userCount++;
     console.log(`[ds-proxy] [${rid}] [openAIToDS] file-offload mode — prompt=${prompt.length} chars (history in file ${offloadedFileId})`);
     return {
@@ -1001,25 +1005,24 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
     const text = extractText(msg);
 
     if (msg.role === "user") {
-      convStr += `${USER_TOKEN}${text}${ASST_OPEN}`;
+      parts.push(`[USER]\n${text}`);
       userCount++;
       i++;
     } else if (msg.role === "assistant") {
       const toolCalls = (msg as any).tool_calls;
       if (toolCalls?.length) {
         const dsmlCalls = buildDsmlCalls(toolCalls);
-        // assistant_msg_template: {content}\n\n<｜DSML｜tool_calls>...</｜DSML｜tool_calls><EOS>
-        convStr += `${text ? text + "\n\n" : ""}<｜DSML｜tool_calls>\n${dsmlCalls}\n</｜DSML｜tool_calls>${EOS}`;
+        parts.push(`[ASSISTANT]\n${text ? text + "\n\n" : ""}<｜DSML｜tool_calls>\n${dsmlCalls}\n</｜DSML｜tool_calls>`);
         assistantCount++;
       } else if (text) {
-        convStr += `${text}${EOS}`;
+        parts.push(`[ASSISTANT]\n${text}`);
         assistantCount++;
       }
       i++;
     } else if (msg.role === "tool") {
       // Merge ALL consecutive tool messages into ONE user block.
       // V4 tool_output_template = "<tool_result>{content}</tool_result>" — no attributes.
-      // Multiple results: joined with "\n\n" inside the same <｜User｜> block.
+      // Multiple results from same turn joined into one block (V4 merge_tool_messages).
       const resultBlocks: string[] = [];
       while (i < nonSystem.length && nonSystem[i].role === "tool") {
         const toolText = extractText(nonSystem[i]);
@@ -1028,10 +1031,10 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
         toolResultCount++;
         i++;
       }
-      convStr += `${USER_TOKEN}${resultBlocks.join("\n\n")}${ASST_OPEN}`;
+      parts.push(`[USER]\n${resultBlocks.join("\n\n")}`);
     } else {
       // Unknown role: treat as user
-      if (text) { convStr += `${USER_TOKEN}${text}${ASST_OPEN}`; userCount++; }
+      if (text) { parts.push(`[USER]\n${text}`); userCount++; }
       i++;
     }
   }
@@ -1041,21 +1044,20 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
   // Short results ({count:14}, {ok:true}) are excluded — overhead outweighs benefit.
   const hasSubstantialResult = toolResultCount > 0 && maxToolResultLen > 500;
   if (hasSubstantialResult) {
-    convStr +=
-      `${USER_TOKEN}` +
+    parts.push(
+      `[USER]\n` +
       `The tool returned the above data. Respond using this two-step approach:\n` +
       `Step 1: List every item exactly as it appears in the tool result — copy names, IDs, and values verbatim, changing nothing.\n` +
       `Step 2: Using only that list from Step 1, answer the original request naturally.\n\n` +
       `CONSTRAINTS:\n` +
       `- If the tool returned N items, your response must contain exactly N items — no more, no fewer.\n` +
       `- NEVER invent, substitute, or paraphrase any name, ID, count, price, or identifier.\n` +
-      `- If you do not have the data, call a tool — never fabricate.` +
-      ASST_OPEN;
+      `- If you do not have the data, call a tool — never fabricate.`
+    );
     userCount++;
   }
 
-  const preamble = parts.join("\n\n");
-  const prompt = BOS + preamble + (convStr ? "\n\n" + convStr : "");
+  const prompt = parts.join("\n\n");
   console.log(`[ds-proxy] [${rid}] [openAIToDS] prompt=${prompt.length} chars | system=${systemCount} assistant=${assistantCount} tool_results=${toolResultCount} user=${userCount} tools=${tools.length} echo_step=${hasSubstantialResult}`);
 
   return {
