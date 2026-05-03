@@ -607,13 +607,46 @@ function dsHeaders(acc: PoolAccount, powResponse?: string | null): Record<string
   return h;
 }
 
-// ─── Context offload threshold ───────────────────────────────────────────────
-// When the estimated prompt exceeds this, serialize history to a file and
-// upload to DeepSeek's file API. Removes the lost-in-the-middle problem by
-// converting old context from inline tokens into a document the model reads.
-const CONTEXT_OFFLOAD_CHARS = 60_000;
-/** Formatting overhead added by openAIToDS (output integrity guard, DSML block, echo-step, labels) */
+// ─── Context file offload ────────────────────────────────────────────────────
+// The web API input limit applies ONLY to the `prompt` field — content in
+// `ref_file_ids` is processed separately and does NOT count toward the limit.
+// (Confirmed via ds2api maintainer + empirical testing: 128K passed, 175K failed.)
+//
+// Strategy:
+//   First turn (messages ≤ 2):  inline everything — ~52K prompt is fine.
+//   Multi-turn (messages > 2):  upload context file (tool schemas + conversation)
+//                                via ref_file_ids, prompt = ~2K DSML instruction only.
+//
+// ds2api defaults to always-offload (min_chars: 0). We offload from turn 2 onward
+// because first-turn file upload adds ~1.5s latency with no benefit (prompt fits).
+const CONTEXT_OFFLOAD_CHARS = 60_000; // Legacy threshold — kept as fallback
+/** Formatting overhead added by openAIToDS (output integrity guard, DSML block, labels) */
 const PROMPT_OVERHEAD_CHARS = 8_000;
+
+// ─── Context file builder ─────────────────────────────────────────────────────
+// Builds a combined file containing tool schemas + conversation history.
+// Uploaded via ref_file_ids so it doesn't count toward the prompt input limit.
+function buildContextFile(messages: any[], toolSchemas?: any[]): string {
+  const sections: string[] = ["# DS2API_CONTEXT.txt"];
+
+  // ── Tool schemas section (if provided) ───────────────────────────────────
+  if (toolSchemas && toolSchemas.length > 0) {
+    sections.push(
+      "",
+      "## Available Tool Schemas",
+      "",
+      JSON.stringify(toolSchemas, null, 2),
+      "",
+    );
+  }
+
+  // ── Conversation history section ─────────────────────────────────────────
+  sections.push("## Conversation History", "");
+  const historyLines = buildHistoryTranscript(messages);
+  sections.push(historyLines);
+
+  return sections.join("\n");
+}
 
 // ─── History transcript builder ───────────────────────────────────────────────
 // Mirrors ds2api's BuildOpenAICurrentInputContextTranscript format exactly.
@@ -828,21 +861,74 @@ function repairLooseJsonArrays(text: string): string {
   });
 }
 
+// ─── Tool schema compression ─────────────────────────────────────────────────
+// Strip parameter descriptions and truncate tool descriptions. The model only
+// needs names, types, and enum values to call tools. Enum values are never
+// touched — they are the primary signal the model uses to pick actions.
+function stripParamDescriptions(schema: any): any {
+  if (!schema || typeof schema !== "object") return schema;
+  if (Array.isArray(schema)) return schema.map(stripParamDescriptions);
+  const out: any = {};
+  for (const key of Object.keys(schema)) {
+    if (key === "description") continue;
+    out[key] = stripParamDescriptions(schema[key]);
+  }
+  return out;
+}
+
+function compressToolSchemas(tools: any[], rid: string): any[] {
+  const toolSchemas = tools.map((t: any) => {
+    const fn = t.function || t;
+    const rawDesc: string = fn.description || "";
+    const rawParams = fn.parameters || fn.input_schema || { type: "object", properties: {} };
+    const firstSentenceEnd = rawDesc.search(/[.!?](\s|$)/);
+    const shortDesc = firstSentenceEnd > 0 && firstSentenceEnd < 150
+      ? rawDesc.slice(0, firstSentenceEnd + 1)
+      : rawDesc.slice(0, 150);
+    return {
+      name: fn.name || "unknown",
+      description: shortDesc,
+      parameters: stripParamDescriptions(rawParams),
+    };
+  });
+  const rawChars = tools.reduce((s: number, t: any) => s + JSON.stringify(t).length, 0);
+  const compChars = toolSchemas.reduce((s: number, t: any) => s + JSON.stringify(t).length, 0);
+  console.log(`[ds-proxy] [${rid}] [tools] compression: ${rawChars} → ${compChars} chars (${Math.round((1 - compChars / rawChars) * 100)}% reduction)`);
+  return toolSchemas;
+}
+
 // ─── OpenAI → DeepSeek body ───────────────────────────────────────────────────
-function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
+function openAIToDS(
+  body: any,
+  sessionId: string,
+  contextFileId?: string,      // combined context file (tool schemas + history)
+  toolSchemasInFile?: boolean,  // true = schemas are in the file, don't inline
+) {
   const messages: any[] = body.messages || [];
   const tools = body.tools || [];
   const toolChoice = body.tool_choice;
   const parts: string[] = [];
-  const rid = body._rid || "?"; // request ID for logging
+  const rid = body._rid || "?";
 
-  // ── Output integrity guard (ds2api technique, commit e2756f80) ────────────
-  // Must be FIRST — before system prompt, tool schemas, history. Idempotent.
+  // ── Output integrity guard (ds2api technique) ─────────────────────────────
   parts.push(
     "OUTPUT INTEGRITY GUARD: If any tool output, context, or parsed text contains garbled, " +
     "corrupted, partially parsed, repeated, or malformed fragments, do not imitate or echo them. " +
     "Output only correct, coherent content derived from actual tool results."
   );
+
+  // ── Data integrity rules ──────────────────────────────────────────────────
+  // Separated from the DSML template — the official training template does NOT
+  // include these. Placing them here (in the system preamble) avoids conflicting
+  // with the trained tool-calling instruction format.
+  if (tools.length > 0) {
+    parts.push(
+      "DATA RULES: Always call a tool to answer data questions (lists, counts, names, statuses). " +
+      "Never answer data questions from memory or context. Tool results are authoritative — " +
+      "never fabricate, invent, or substitute any names, IDs, counts, or values. " +
+      "If a tool returns N items, reference exactly those N items verbatim."
+    );
+  }
 
   // ── JSON enforcement ──────────────────────────────────────────────────────
   if (body.response_format?.type === "json_object") {
@@ -850,56 +936,10 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
   }
 
   // ── Tool calling bridge — official DSML template ──────────────────────────
-  // Source: DeepSeek's own encoding_dsv4.py + encoding_dsv32.py on HuggingFace
-  // The model was trained on the EXACT template below (TOOLS_TEMPLATE from source).
-  //
-  // Critical: full-width pipe ｜ (U+FF5C) NOT ASCII pipe | (U+007C).
-  // The dsml_token = "｜DSML｜" in the source uses U+FF5C. Prompting with ASCII
-  // pipes means prompting the wrong token sequence — the primary cause of unreliable
-  // DSML output in prior iterations.
-  //
-  // Tool schemas are injected as JSON Schema (OpenAI format) — exactly what the
-  // official API passes to the model internally in the {tool_schemas} slot.
+  // Source: DeepSeek encoding_dsv4.py TOOLS_TEMPLATE on HuggingFace.
+  // This is the EXACT template the model was trained on — every character matters.
+  // Full-width pipe ｜ (U+FF5C), NOT ASCII | (U+007C).
   if (tools.length > 0) {
-    // ── Tool schema compression ───────────────────────────────────────────────
-    // The web API has a hard input limit (~60K chars). All 42 meta-tool schemas
-    // serialized verbatim = ~165K chars (95% of the prompt). We strip parameter
-    // descriptions and truncate tool descriptions before inlining — the model
-    // only needs names, types, and enum values to call tools correctly.
-    // Enum values (action, entity, etc.) are never touched — they are values,
-    // not descriptions, and are the primary signal the model uses to pick actions.
-    function stripParamDescriptions(schema: any): any {
-      if (!schema || typeof schema !== "object") return schema;
-      if (Array.isArray(schema)) return schema.map(stripParamDescriptions);
-      const out: any = {};
-      for (const key of Object.keys(schema)) {
-        if (key === "description") continue; // strip — model infers from param name
-        out[key] = stripParamDescriptions(schema[key]);
-      }
-      return out;
-    }
-
-    // JSON Schema definitions — matches what the official DeepSeek API sends internally
-    const toolSchemas = tools.map((t: any) => {
-      const fn = t.function || t;
-      const rawDesc: string = fn.description || "";
-      const rawParams = fn.parameters || fn.input_schema || { type: "object", properties: {} };
-      // Truncate description to first sentence or 150 chars, whichever is shorter
-      const firstSentenceEnd = rawDesc.search(/[.!?](\s|$)/);
-      const shortDesc = firstSentenceEnd > 0 && firstSentenceEnd < 150
-        ? rawDesc.slice(0, firstSentenceEnd + 1)
-        : rawDesc.slice(0, 150);
-      return {
-        name: fn.name || "unknown",
-        description: shortDesc,
-        parameters: stripParamDescriptions(rawParams),
-      };
-    });
-
-    const rawToolChars = tools.reduce((s: number, t: any) => s + JSON.stringify(t).length, 0);
-    const compressedToolChars = toolSchemas.reduce((s: number, t: any) => s + JSON.stringify(t).length, 0);
-    console.log(`[ds-proxy] [${rid}] [openAIToDS] tool schema compression: ${rawToolChars} → ${compressedToolChars} chars (${Math.round((1 - compressedToolChars / rawToolChars) * 100)}% reduction)`);
-
     // tool_choice enforcement
     let choiceHint = "";
     if (toolChoice === "required" || toolChoice === "any") {
@@ -910,55 +950,68 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
       choiceHint = "\n\nDo NOT call any tools. Respond with plain text only.";
     }
 
-    // Official TOOLS_TEMPLATE from encoding_dsv4.py — verbatim, with full-width ｜
-    parts.push(
-      `## Tools\n\n` +
-      `You have access to a set of tools to help answer the user's question. ` +
-      `You can invoke tools by writing a "<｜DSML｜tool_calls>" block like the following as part of your reply. ` +
-      `You can use tools multiple times in a single reply.\n\n` +
-      `<｜DSML｜tool_calls>\n` +
-      `<｜DSML｜invoke name="$TOOL_NAME">\n` +
-      `<｜DSML｜parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜parameter>\n` +
-      `</｜DSML｜invoke>\n` +
-      `</｜DSML｜tool_calls>\n\n` +
-      `String parameters should be specified as is and set \`string="true"\`. ` +
-      `For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set \`string="false"\`.\n\n` +
-      `### Available Tool Schemas\n\n` +
-      `${JSON.stringify(toolSchemas, null, 2)}\n\n` +
-      `You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n\n` +
-      `After </｜DSML｜tool_calls> STOP immediately — no trailing text or explanation.\n\n` +
-      `CRITICAL DATA RULES:\n` +
-      `- ALWAYS call a tool to answer data questions (lists, counts, names, IDs, statuses). NEVER answer from memory or context.\n` +
-      `- Tool results are AUTHORITATIVE. NEVER fabricate, invent, or substitute names, IDs, counts, or any values.\n` +
-      `- If a tool returns N items, your response must reference exactly those N items verbatim.\n` +
-      `- If you need data, call a tool — NEVER guess or hallucinate.` +
-      `${choiceHint}`
-    );
+    // ── Official TOOLS_TEMPLATE (verbatim from encoding_dsv4.py) ────────────
+    // Changes from prior version:
+    //   1. "CRITICAL DATA RULES" block REMOVED — not in training data, moved to preamble
+    //   2. "After STOP" instruction REMOVED — not in training data
+    //   3. Thinking mode conditional ADDED — matches official template
+    const thinkingInstruction = body.thinking_enabled
+      ? `\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n`
+      : "";
 
-    console.log(`[ds-proxy] [${rid}] [openAIToDS] injected ${tools.length} tool schemas (official DSML template, full-width ｜), tool_choice=${typeof toolChoice === "object" ? JSON.stringify(toolChoice) : toolChoice || "auto"}`);
+    if (toolSchemasInFile) {
+      // Schemas are in the context file — just reference them
+      parts.push(
+        `## Tools\n\n` +
+        `You have access to a set of tools to help answer the user's question. ` +
+        `You can invoke tools by writing a "<｜DSML｜tool_calls>" block like the following as part of your reply. ` +
+        `You can use tools multiple times in a single reply.\n\n` +
+        `<｜DSML｜tool_calls>\n` +
+        `<｜DSML｜invoke name="$TOOL_NAME">\n` +
+        `<｜DSML｜parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜parameter>\n` +
+        `</｜DSML｜invoke>\n` +
+        `</｜DSML｜tool_calls>\n\n` +
+        `String parameters should be specified as is and set \`string="true"\`. ` +
+        `For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set \`string="false"\`.` +
+        `${thinkingInstruction}\n\n` +
+        `### Available Tool Schemas\n\n` +
+        `The complete tool definitions are in the attached context file under "Available Tool Schemas". ` +
+        `You MUST strictly follow the tool names and parameter schemas defined there to invoke tool calls.` +
+        `${choiceHint}`
+      );
+    } else {
+      // Schemas inline in prompt (first turn, no file upload)
+      const toolSchemas = compressToolSchemas(tools, rid);
+      parts.push(
+        `## Tools\n\n` +
+        `You have access to a set of tools to help answer the user's question. ` +
+        `You can invoke tools by writing a "<｜DSML｜tool_calls>" block like the following as part of your reply. ` +
+        `You can use tools multiple times in a single reply.\n\n` +
+        `<｜DSML｜tool_calls>\n` +
+        `<｜DSML｜invoke name="$TOOL_NAME">\n` +
+        `<｜DSML｜parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜parameter>\n` +
+        `</｜DSML｜invoke>\n` +
+        `</｜DSML｜tool_calls>\n\n` +
+        `String parameters should be specified as is and set \`string="true"\`. ` +
+        `For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set \`string="false"\`.` +
+        `${thinkingInstruction}\n\n` +
+        `### Available Tool Schemas\n\n` +
+        `${JSON.stringify(toolSchemas, null, 2)}\n\n` +
+        `You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.` +
+        `${choiceHint}`
+      );
+    }
+
+    console.log(`[ds-proxy] [${rid}] [openAIToDS] ${toolSchemasInFile ? "schemas in file" : "schemas inline"} | ${tools.length} tools (DSML V4, full-width ｜), tool_choice=${typeof toolChoice === "object" ? JSON.stringify(toolChoice) : toolChoice || "auto"}`);
   }
 
-  // ── Build conversation in official DeepSeek V4 format ─────────────────────
-  // Source: encoding_dsv4.py from HuggingFace (read directly, May 2026).
+  // ── Build conversation ─────────────────────────────────────────────────────
+  // V4 format from encoding_dsv4.py.
   //
-  // V4 special tokens used in the prompt:
-  //   BOS:         <｜begin▁of▁sentence｜>            — first character of every prompt
-  //   User turn:   <｜User｜>{content}<｜Assistant｜></think>   — user msg + asst prefix (chat mode)
-  //   Asst turn:   {content}<｜end▁of▁sentence｜>              — response with EOS
-  //   Tool call:   {text}\n\n<｜DSML｜tool_calls>...</｜DSML｜tool_calls><｜end▁of▁sentence｜>
-  //   Tool result: <｜User｜><tool_result>{content}</tool_result><｜Assistant｜></think>
-  //     • NO tool_call_id attribute — training format has none
-  //     • Multiple results from same turn merged into ONE user block (V4 merge_tool_messages)
-  //
-  // Preamble (OUTPUT INTEGRITY GUARD, ## Tools) is joined before the conversation.
-
-  // Role labels for conversation structure.
-  // NOTE: V4 special tokens (<｜User｜>, <｜Assistant｜>, BOS, EOS) cause the DeepSeek
-  // web API to return empty responses — the web endpoint blocks prompts containing
-  // the model's own special tokens (treated as prompt injection). These plain-text
-  // labels are understood by the model from pre-training data and work correctly
-  // with the web API endpoint. DSML tool call tokens (<｜DSML｜invoke> etc.) are safe
-  // because they only appear in the model's OUTPUT, not injected into the prompt context.
+  // Web API blocks the model's own special tokens (<｜User｜>, <｜Assistant｜>,
+  // BOS, EOS) — treats them as prompt injection. We use plain-text [USER] /
+  // [ASSISTANT] labels which the model understands from pre-training data.
+  // DSML tokens (<｜DSML｜invoke> etc.) are safe — they only appear in OUTPUT.
   const USER_TOKEN = "[USER]\n";
   const ASST_OPEN = "\n\n[ASSISTANT]\n";
 
@@ -971,7 +1024,6 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
   }
 
   function buildDsmlCalls(toolCalls: any[]): string {
-    // Source: encoding_dsv4.py tool_call_template + encode_arguments_to_dsml
     return toolCalls.map((tc: any) => {
       const name = tc.function?.name || tc.name || "unknown";
       let argsObj: Record<string, any> = {};
@@ -992,23 +1044,24 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
 
   let systemCount = 0, assistantCount = 0, toolResultCount = 0, userCount = 0;
 
-  // ── File-offload mode ─────────────────────────────────────────────────────
-  if (offloadedFileId) {
+  // ── Context-file mode ────────────────────────────────────────────────────
+  // Tool schemas + conversation history are in the uploaded file.
+  // Prompt = preamble (DSML instruction, data rules) + brief reference.
+  if (contextFileId) {
     const preamble = parts.join("\n\n");
     const prompt =
       preamble + "\n\n" +
       "[USER]\n" +
-      "Review the attached DS2API_HISTORY.txt which contains the conversation so far. " +
-      "Answer the latest user request. If you need fresh data that is not already in the history, " +
-      "call the appropriate tool — do not fabricate or guess values. " +
-      "Never invent names, IDs, counts, or any other data.";
+      "The attached context file contains the tool definitions and the full conversation history. " +
+      "Answer the latest user request. If you need data, call the appropriate tool — " +
+      "never fabricate or guess values.";
     userCount++;
-    console.log(`[ds-proxy] [${rid}] [openAIToDS] file-offload mode — prompt=${prompt.length} chars (history in file ${offloadedFileId})`);
+    console.log(`[ds-proxy] [${rid}] [openAIToDS] context-file mode — prompt=${prompt.length} chars (context in file ${contextFileId})`);
     return {
       chat_session_id: sessionId,
       parent_message_id: null,
       prompt,
-      ref_file_ids: [offloadedFileId],
+      ref_file_ids: [contextFileId],
       thinking_enabled: !!body.thinking_enabled,
       search_enabled: !!body.search_enabled,
       model_type: body.model_type || "expert",
@@ -1051,17 +1104,17 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
       i++;
     } else if (msg.role === "tool") {
       // Merge ALL consecutive tool messages into ONE user block.
-      // V4 tool_output_template = "<tool_result>{content}</tool_result>" — no attributes.
-      // Multiple results from same turn joined into one block (V4 merge_tool_messages).
+      // V4 tool_output_template = "<tool_result>{content}</tool_result>" — inline, no newlines.
+      // Multiple results from same turn merged (V4 merge_tool_messages).
       const resultBlocks: string[] = [];
       while (i < nonSystem.length && nonSystem[i].role === "tool") {
         const toolText = extractText(nonSystem[i]);
-        resultBlocks.push(`<tool_result>\n${toolText}\n</tool_result>`);
+        resultBlocks.push(`<tool_result>${toolText}</tool_result>`);
         if (toolText.length > maxToolResultLen) maxToolResultLen = toolText.length;
         toolResultCount++;
         i++;
       }
-      parts.push(`[USER]\n${resultBlocks.join("\n\n")}`);
+      parts.push(`[USER]\n${resultBlocks.join("\n")}`);
     } else {
       // Unknown role: treat as user
       if (text) { parts.push(`[USER]\n${text}`); userCount++; }
@@ -1335,39 +1388,33 @@ async function doCompletion(body: any, acc: PoolAccount, rid: string) {
   }
   console.log(`[ds-proxy] [completion] [${rid}] session=${sessionId} (${Date.now() - t0}ms)`);
 
-  // ── Context offload check ────────────────────────────────────────────────
-  // Estimate the inline prompt size. If it would exceed the threshold, upload
-  // the conversation history as a file — this removes the lost-in-the-middle
-  // problem by converting buried context into a document DeepSeek reads cleanly.
-  let offloadedFileId: string | undefined;
+  // ── Context file upload ──────────────────────────────────────────────────
+  // Strategy (from ds2api research + empirical testing):
+  //   First turn (messages ≤ 2):  inline everything — prompt ~52K fits fine.
+  //   Multi-turn (messages > 2):  upload context file (tool schemas + history)
+  //                                via ref_file_ids — prompt drops to ~2K.
+  //
+  // The web API input limit applies ONLY to the `prompt` field. Content in
+  // ref_file_ids is processed separately — no limit. This eliminates all
+  // prompt growth concerns for multi-turn agentic conversations.
+  let contextFileId: string | undefined;
+  let toolSchemasInFile = false;
   const messages: any[] = body.messages || [];
   const tools: any[] = body.tools || [];
   const modelType: string = body.model_type || "expert";
 
-  if (tools.length > 0 && messages.length > 2) {
-    // Estimate conversation history size only — tool schemas are in the preamble and
-    // always visible to the model regardless of context length, so counting them here
-    // would cause every request with many tools (42 in MAI) to hit the offload threshold
-    // even on the very first message, defeating the purpose of the threshold entirely.
-    // Context offload is for LONG CONVERSATION history (tool results, prior turns),
-    // not for the fixed preamble overhead.
-    const msgChars = messages.reduce((sum, m) => {
-      const text = typeof m.content === "string" ? m.content.length
-        : Array.isArray(m.content) ? m.content.reduce((s: number, b: any) => s + (b.text?.length || 0), 0)
-        : 0;
-      return sum + text;
-    }, 0);
-    const estimatedSize = msgChars + PROMPT_OVERHEAD_CHARS;
-
-    if (estimatedSize > CONTEXT_OFFLOAD_CHARS) {
-      console.log(`[ds-proxy] [${rid}] [context-offload] estimated ${estimatedSize} chars > ${CONTEXT_OFFLOAD_CHARS} threshold — uploading history`);
-      const transcript = buildHistoryTranscript(messages);
-      offloadedFileId = await uploadHistoryFile(acc, transcript, modelType, rid) || undefined;
-      if (offloadedFileId) {
-        console.log(`[ds-proxy] [${rid}] [context-offload] ✓ history offloaded to ${offloadedFileId} — inline prompt will be minimal`);
-      } else {
-        console.warn(`[ds-proxy] [${rid}] [context-offload] ⚠ upload failed — falling back to inline (hallucination risk at ${estimatedSize} chars)`);
-      }
+  const isMultiTurn = tools.length > 0 && messages.length > 2;
+  if (isMultiTurn) {
+    // Build combined context file: tool schemas + full conversation history
+    const toolSchemas = compressToolSchemas(tools, rid);
+    const contextContent = buildContextFile(messages, toolSchemas);
+    console.log(`[ds-proxy] [${rid}] [context-file] multi-turn detected (${messages.length} msgs) — uploading context file (${contextContent.length} chars)`);
+    contextFileId = await uploadHistoryFile(acc, contextContent, modelType, rid) || undefined;
+    if (contextFileId) {
+      toolSchemasInFile = true;
+      console.log(`[ds-proxy] [${rid}] [context-file] ✓ context uploaded to ${contextFileId} — prompt will be ~2K`);
+    } else {
+      console.warn(`[ds-proxy] [${rid}] [context-file] ⚠ upload failed — falling back to inline`);
     }
   }
 
@@ -1377,7 +1424,7 @@ async function doCompletion(body: any, acc: PoolAccount, rid: string) {
   const upstream = await fetch(`${DS_API}/api/v0/chat/completion`, {
     method: "POST",
     headers: dsHeaders(acc, pow),
-    body: JSON.stringify(openAIToDS({ ...body, _rid: rid }, sessionId, offloadedFileId)),
+    body: JSON.stringify(openAIToDS({ ...body, _rid: rid }, sessionId, contextFileId, toolSchemasInFile)),
   });
   console.log(`[ds-proxy] [completion] [${rid}] upstream HTTP ${upstream.status} (${Date.now() - t0}ms total)`);
 
