@@ -1806,9 +1806,12 @@ Bun.serve({
         console.warn(`[ds-proxy] [${rid}] relogin-all — unauthorized`);
         return Response.json({ error: "Unauthorized" }, { status: 401 });
       }
-      // Include non-active accounts AND active ones that have been failing
-      // (aisha gets re-synced as "active" but her token is expired — failureCount tracks this)
-      const targets = pool.filter(a => a.email && a.password && (a.status !== "active" || a.failureCount > 0));
+      // Include non-active accounts AND active ones that have been failing.
+      // ?force=true relogins ALL accounts with passwords (useful after deploy when failureCount resets)
+      const force = url.searchParams.get("force") === "true";
+      const targets = force
+        ? pool.filter(a => a.email && a.password)
+        : pool.filter(a => a.email && a.password && (a.status !== "active" || a.failureCount > 0));
       console.log(`[ds-proxy] [${rid}] relogin-all — ${targets.length} account(s) to re-login: ${targets.map(a => `${a.email}(${a.status},fails=${a.failureCount})`).join(", ")}`);
       targets.forEach(a => reloginAccount(a).catch(() => {}));
       return Response.json({ ok: true, relogging: targets.length, accounts: targets.map(a => a.email) });
