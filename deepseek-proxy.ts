@@ -861,15 +861,44 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
   // Tool schemas are injected as JSON Schema (OpenAI format) — exactly what the
   // official API passes to the model internally in the {tool_schemas} slot.
   if (tools.length > 0) {
+    // ── Tool schema compression ───────────────────────────────────────────────
+    // The web API has a hard input limit (~60K chars). All 42 meta-tool schemas
+    // serialized verbatim = ~165K chars (95% of the prompt). We strip parameter
+    // descriptions and truncate tool descriptions before inlining — the model
+    // only needs names, types, and enum values to call tools correctly.
+    // Enum values (action, entity, etc.) are never touched — they are values,
+    // not descriptions, and are the primary signal the model uses to pick actions.
+    function stripParamDescriptions(schema: any): any {
+      if (!schema || typeof schema !== "object") return schema;
+      if (Array.isArray(schema)) return schema.map(stripParamDescriptions);
+      const out: any = {};
+      for (const key of Object.keys(schema)) {
+        if (key === "description") continue; // strip — model infers from param name
+        out[key] = stripParamDescriptions(schema[key]);
+      }
+      return out;
+    }
+
     // JSON Schema definitions — matches what the official DeepSeek API sends internally
     const toolSchemas = tools.map((t: any) => {
       const fn = t.function || t;
+      const rawDesc: string = fn.description || "";
+      const rawParams = fn.parameters || fn.input_schema || { type: "object", properties: {} };
+      // Truncate description to first sentence or 150 chars, whichever is shorter
+      const firstSentenceEnd = rawDesc.search(/[.!?](\s|$)/);
+      const shortDesc = firstSentenceEnd > 0 && firstSentenceEnd < 150
+        ? rawDesc.slice(0, firstSentenceEnd + 1)
+        : rawDesc.slice(0, 150);
       return {
         name: fn.name || "unknown",
-        description: fn.description || "",
-        parameters: fn.parameters || fn.input_schema || { type: "object", properties: {} },
+        description: shortDesc,
+        parameters: stripParamDescriptions(rawParams),
       };
     });
+
+    const rawToolChars = tools.reduce((s: number, t: any) => s + JSON.stringify(t).length, 0);
+    const compressedToolChars = toolSchemas.reduce((s: number, t: any) => s + JSON.stringify(t).length, 0);
+    console.log(`[ds-proxy] [${rid}] [openAIToDS] tool schema compression: ${rawToolChars} → ${compressedToolChars} chars (${Math.round((1 - compressedToolChars / rawToolChars) * 100)}% reduction)`);
 
     // tool_choice enforcement
     let choiceHint = "";
@@ -1950,6 +1979,18 @@ Bun.serve({
             }
           } else {
             console.warn(`[ds-proxy] [${rid}] [v4-continue] ⚠ INCOMPLETE but no message_id in SSE events — returning partial (${fullText.length} chars)`);
+          }
+        }
+
+        // Strip <think>...</think> blocks emitted by R1 (model_type: "expert")
+        // The web API auto-routes complex queries to DeepSeek-R1 which prefixes
+        // responses with chain-of-thought reasoning wrapped in <think> tags.
+        // These are internal reasoning traces — not part of the answer.
+        if (fullText.includes("<think>")) {
+          const beforeStrip = fullText.length;
+          fullText = fullText.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trimStart();
+          if (process.env.DEBUG || beforeStrip !== fullText.length) {
+            console.log(`[ds-proxy] [${rid}] [r1-strip] stripped <think> block: ${beforeStrip} → ${fullText.length} chars`);
           }
         }
 
