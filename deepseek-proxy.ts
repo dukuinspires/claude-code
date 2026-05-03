@@ -410,7 +410,7 @@ async function loginDeepSeek(email: string, password: string, deviceId?: string)
 
 /** Try VPS OAuth relogin first (same flow that registered accounts successfully).
  *  Falls back to password login if VPS OAuth is unavailable. */
-async function reloginViaVpsOAuth(email: string): Promise<string | null> {
+async function reloginViaVpsOAuth(email: string, password?: string): Promise<string | null> {
   const vpsUrl = process.env.VPS_PROXY_URL;
   const vpsSecret = process.env.SMTP_PROXY_SECRET;
   if (!vpsUrl || !vpsSecret) {
@@ -427,7 +427,7 @@ async function reloginViaVpsOAuth(email: string): Promise<string | null> {
         "content-type": "application/json",
         "x-smtp-proxy-secret": vpsSecret,
       },
-      body: JSON.stringify({ email, mode: "relogin" }),
+      body: JSON.stringify({ email, password, mode: "relogin" }),
       signal: AbortSignal.timeout(120_000), // VPS OAuth can take up to 60s
     });
     const elapsed = Date.now() - t0;
@@ -452,7 +452,7 @@ async function reloginAccount(acc: PoolAccount) {
   const t0 = Date.now();
 
   // Try VPS OAuth first (same flow that successfully registered accounts)
-  let newToken = await reloginViaVpsOAuth(acc.email);
+  let newToken = await reloginViaVpsOAuth(acc.email, acc.password);
 
   // Fallback: password login via VPS (may get RISK_DEVICE_DETECTED)
   if (!newToken && acc.password) {
@@ -1806,8 +1806,10 @@ Bun.serve({
         console.warn(`[ds-proxy] [${rid}] relogin-all — unauthorized`);
         return Response.json({ error: "Unauthorized" }, { status: 401 });
       }
-      const targets = pool.filter(a => a.status !== "active" && a.email && a.password);
-      console.log(`[ds-proxy] [${rid}] relogin-all — ${targets.length} account(s) to re-login: ${targets.map(a => a.email).join(", ")}`);
+      // Include non-active accounts AND active ones that have been failing
+      // (aisha gets re-synced as "active" but her token is expired — failureCount tracks this)
+      const targets = pool.filter(a => a.email && a.password && (a.status !== "active" || a.failureCount > 0));
+      console.log(`[ds-proxy] [${rid}] relogin-all — ${targets.length} account(s) to re-login: ${targets.map(a => `${a.email}(${a.status},fails=${a.failureCount})`).join(", ")}`);
       targets.forEach(a => reloginAccount(a).catch(() => {}));
       return Response.json({ ok: true, relogging: targets.length, accounts: targets.map(a => a.email) });
     }
