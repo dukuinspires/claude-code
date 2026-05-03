@@ -1858,6 +1858,9 @@ Bun.serve({
         // a continuation request. Without this, responses silently truncate.
         let needsContinuation = false;
         let responseMessageId: number | null = null;
+        // Raw SSE capture for empty-response diagnostics (kept until fullText > 0)
+        const rawSseCapture: string[] = [];
+        const MAX_RAW_CAPTURE = 30;
         try {
           while (true) {
             const { done, value } = await reader.read();
@@ -1866,6 +1869,10 @@ Bun.serve({
             const lines = sseBuffer.split("\n");
             sseBuffer = lines.pop() || "";
             for (const line of lines) {
+              // Capture raw lines for empty-response diagnostics
+              if (rawSseCapture.length < MAX_RAW_CAPTURE && line.trim()) {
+                rawSseCapture.push(line.slice(0, 400));
+              }
               if (!line.trim() || line.startsWith("event:") || !line.startsWith("data:")) continue;
               const data = line.slice(5).trim();
               if (!data) continue;
@@ -1904,11 +1911,21 @@ Bun.serve({
                     console.log(`[ds-proxy] [${rid}] [sse-diag] unhandled object event: ${JSON.stringify(event).slice(0, 300)}`);
                   }
                 }
-              } catch { /* skip */ }
+              } catch (parseErr: any) {
+                // Log unparseable SSE data on empty responses
+                if (chunkCount === 0 && rawSseCapture.length <= MAX_RAW_CAPTURE) {
+                  console.log(`[ds-proxy] [${rid}] [sse-diag] JSON parse fail: ${data.slice(0, 200)}`);
+                }
+              }
             }
           }
         } finally {
           reader.cancel();
+        }
+        // Dump raw SSE events when response is empty — to diagnose API rejections
+        if (fullText.length === 0 && rawSseCapture.length > 0) {
+          console.log(`[ds-proxy] [${rid}] [sse-dump] EMPTY RESPONSE — raw SSE events (${rawSseCapture.length}):`);
+          rawSseCapture.forEach((line, i) => console.log(`[ds-proxy] [${rid}] [sse-dump]   [${i}] ${line}`));
         }
         // V4 auto-continue loop — up to 8 rounds (mirrors ds2api defaultAutoContinueLimit)
         // When DeepSeek V4 signals INCOMPLETE, call /api/v0/chat/continue to resume.
