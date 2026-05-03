@@ -1484,6 +1484,8 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
 
 function stripToolCallText(text: string): string {
   text = normalizeDsmlText(text);
+  // Strip "FINISHED" marker — DeepSeek R1/V3 sometimes appends this to every response
+  text = text.replace(/FINISHED\s*$/g, "").replace(/^FINISHED\s*/g, "");
   return text
     // DSML V4: <｜DSML｜tool_calls>...<[/]｜DSML｜tool_calls> (closing slash optional)
     .replace(/<[｜|]?DSML[｜|]tool_calls>[\s\S]*?<[\/]?[｜|]?DSML[｜|]tool_calls>/g, "")
@@ -2292,8 +2294,9 @@ Bun.serve({
               }
               emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
             } else {
-              // No tool calls — emit text as normal stream
-              emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: fullText }, finish_reason: null }] });
+              // No tool calls — emit clean text as normal stream
+              const cleanContent = stripToolCallText(fullText).trim() || fullText;
+              emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: cleanContent }, finish_reason: null }] });
               emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
             }
             controller.enqueue(te.encode("data: [DONE]\n\n"));
@@ -2372,12 +2375,13 @@ Bun.serve({
         });
       }
 
+      const cleanNonStream = stripToolCallText(fullText).trim() || fullText;
       return Response.json({
         id: `chatcmpl-ds-${Date.now()}`,
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
         model: body.model,
-        choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" }],
+        choices: [{ index: 0, message: { role: "assistant", content: cleanNonStream }, finish_reason: "stop" }],
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       });
     }
