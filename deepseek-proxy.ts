@@ -1165,21 +1165,32 @@ function openAIToDS(
 interface ParsedToolCall { name: string; input: Record<string, any> }
 
 /**
- * Normalize Unicode lookalike characters the model uses in place of the DSML
- * full-width pipe ｜ (U+FF5C). DeepSeek sometimes generates ︵ (U+FE35),
- * （ (U+FF08), or other curved/bracket variants, especially when routed to R1.
- * Normalizing before parsing makes all downstream regexes work without changes.
+ * Normalize DSML-like tags to the canonical format <｜DSML｜...>.
+ *
+ * The model generates many variants of the DSML prefix:
+ *   - <｜DSML｜tool_calls>    (correct, full-width pipe U+FF5C)
+ *   - <DSML︵tool_calls>      (U+FE35 curved bracket — R1 variant)
+ *   - <｜psml▁tool_calls>     (wrong prefix name + sentencepiece underbar)
+ *   - <DSMLinvoke>             (missing pipes)
+ *   - <|DSML|invoke>           (ASCII pipe)
+ *
+ * All are structurally identical: open/close tags with invoke + parameter children.
+ * This normalizer canonicalizes ALL variants so downstream parsing just works.
  */
 function normalizeDsmlText(text: string): string {
-  // Replace any character that appears between < and DSML or after DSML and before >
-  // with the canonical full-width pipe ｜ (U+FF5C).
-  // Common lookalikes observed: ︵ (FE35), ︶ (FE36), （ (FF08), ） (FF09), | (007C)
+  // Match any tag that looks like <[separator]WORD[separator]keyword> where
+  // keyword is tool_calls, function_calls, invoke, or parameter.
+  // Canonicalize to <｜DSML｜keyword>.
   return text
-    .replace(/<[^\x00-\x7F｜]DSML[^\x00-\x7F｜]/g, (m) => "<｜DSML｜")
-    .replace(/<\/[^\x00-\x7F｜]DSML[^\x00-\x7F｜]/g, "</｜DSML｜")
-    // Also handle when the model omits pipes entirely: <DSMLinvoke → <｜DSML｜invoke
-    .replace(/<DSML([a-z_])/gi, "<｜DSML｜$1")
-    .replace(/<\/DSML([a-z_])/gi, "</｜DSML｜$1");
+    // Opening tags: <｜psml▁invoke>, <DSML︵tool_calls>, <|DSML|param>, etc.
+    .replace(/<[｜|]?(?:DSML|psml|dsml)[｜|▁︵︶（）]?(tool_calls|function_calls|invoke|parameter)/gi,
+      (_, keyword) => `<｜DSML｜${keyword.toLowerCase()}`)
+    // Closing tags: </｜psml▁invoke>, </DSML︵tool_calls>, etc.
+    .replace(/<\/[｜|]?(?:DSML|psml|dsml)[｜|▁︵︶（）]?(tool_calls|function_calls|invoke|parameter)/gi,
+      (_, keyword) => `</｜DSML｜${keyword.toLowerCase()}`)
+    // Closing delimiters inside parameter tags: value</｜psml▁parameter> etc.
+    .replace(/[｜|▁︵︶](?:DSML|psml|dsml)[｜|▁︵︶]?(parameter)>/gi,
+      `｜DSML｜parameter>`);
 }
 
 function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] {
