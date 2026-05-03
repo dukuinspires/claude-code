@@ -2156,9 +2156,17 @@ Bun.serve({
       const setupMs = Date.now() - t0;
       console.log(`[ds-proxy] [${rid}] ✓ upstream ready — account=${usedAcc!.email || "??"} session=${sessionId} setupMs=${setupMs}`);
 
-      // ── Streaming ────────────────────────────────────────────────────────
-      // Buffer the full response, then check for tool calls before emitting.
-      // If tool calls found, emit them as structured tool_calls instead of text.
+      // ── Streaming with real-time text + tool sieve ─────────────────────
+      // Stream text tokens to the client in real-time as they arrive.
+      // When a DSML tool call marker is detected, stop streaming text and
+      // buffer the rest for tool call extraction. This gives the user
+      // immediate feedback ("I'll look up your campaigns...") while the
+      // tool call portion is parsed behind the scenes.
+      //
+      // Architecture:
+      //   Phase 1 (streaming): emit text chunks via SSE as DeepSeek generates them
+      //   Phase 2 (sieve):     when <｜DSML｜ or similar detected, buffer remainder
+      //   Phase 3 (emit):      parse buffered DSML, emit structured tool_calls
       if (isStream) {
         const reader = upstream!.body!.getReader();
         const decoder = new TextDecoder();
@@ -2166,12 +2174,37 @@ Bun.serve({
         let fullText = "";
         let chunkCount = 0;
 
-        // Collect full response — handles V4 continuation states (INCOMPLETE/auto_continue)
-        // DeepSeek V4 can signal mid-stream that the response is incomplete and needs
-        // a continuation request. Without this, responses silently truncate.
+        // Tool sieve state
+        const te = new TextEncoder();
+        const msgId = `chatcmpl-ds-${Date.now()}`;
+        let streamedChars = 0; // chars already sent to client
+        let toolSieveActive = false; // true once DSML marker detected
+
+        // DSML detection patterns — if any match in accumulated text, switch to buffering
+        const DSML_MARKERS = /(?:<[｜|＃#\uff00-\uffff]|<DSML|<dsml|<psml|<invoke\s|<function_calls|<tool_calls|\[tool_call:)/i;
+
+        // Create the response stream that we'll write to incrementally
+        let streamController: ReadableStreamDefaultController | null = null;
+        const responseStream = new ReadableStream({
+          start(controller) { streamController = controller; },
+        });
+
+        const sseEmit = (chunk: any) => {
+          if (streamController) {
+            try {
+              streamController.enqueue(te.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            } catch { /* controller closed */ }
+          }
+        };
+
+        // Start sending the response immediately (headers go out now)
+        const responsePromise = new Response(responseStream, {
+          headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+        });
+
+        // Collect and stream — handles V4 continuation states (INCOMPLETE/auto_continue)
         let needsContinuation = false;
         let responseMessageId: number | null = null;
-        // Raw SSE capture for empty-response diagnostics (kept until fullText > 0)
         const rawSseCapture: string[] = [];
         const MAX_RAW_CAPTURE = 30;
         try {
@@ -2202,9 +2235,37 @@ Bun.serve({
                 if (typeof mid === "number") responseMessageId = mid;
                 else if (typeof mid === "string" && /^\d+$/.test(mid)) responseMessageId = parseInt(mid, 10);
                 if (event.v && typeof event.v === "string") {
-                  // Capture both bare text chunks AND APPEND events (which have event.p set)
                   fullText += event.v;
                   chunkCount++;
+                  // ── Real-time streaming: emit text to client as it arrives ──
+                  if (!toolSieveActive) {
+                    // Check if this chunk or accumulated text contains a tool call marker
+                    if (DSML_MARKERS.test(fullText.slice(streamedChars))) {
+                      toolSieveActive = true;
+                      // Emit any text BEFORE the marker that hasn't been streamed yet
+                      const markerIdx = fullText.slice(streamedChars).search(DSML_MARKERS);
+                      if (markerIdx > 0) {
+                        const preMarkerText = fullText.slice(streamedChars, streamedChars + markerIdx);
+                        const cleanPre = preMarkerText.replace(/FINISHED\s*$/g, "").trim();
+                        if (cleanPre) {
+                          sseEmit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: cleanPre }, finish_reason: null }] });
+                          streamedChars += markerIdx;
+                        }
+                      }
+                      // From here on, buffer everything for tool call parsing
+                    } else {
+                      // No tool marker yet — stream text to client in real-time
+                      // Keep a small lookback buffer (50 chars) to avoid splitting a marker across chunks
+                      const safeEnd = fullText.length - 50;
+                      if (safeEnd > streamedChars) {
+                        const chunk = fullText.slice(streamedChars, safeEnd).replace(/FINISHED/g, "");
+                        if (chunk) {
+                          sseEmit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }] });
+                        }
+                        streamedChars = safeEnd;
+                      }
+                    }
+                  }
                 } else if (typeof event.v === "object" && event.v !== null) {
                   // Check for fragment arrays (JSON Patch replace on response/fragments)
                   if (Array.isArray(event.v)) {
@@ -2295,49 +2356,44 @@ Bun.serve({
           }
         }
 
-        // Log response preview for debugging
+        // Log response preview
         console.log(`[ds-proxy] [${rid}] [response] preview: "${fullText.slice(0, 200).replace(/\n/g, "\\n")}${fullText.length > 200 ? "..." : ""}"`);
 
-        // Check for tool calls in the collected text
+        // ── Final emission: tool calls and/or remaining unstreamed text ───
         const streamToolCalls = extractToolCallsFromText(fullText, rid);
-        const msgId = `chatcmpl-ds-${Date.now()}`;
-        const te = new TextEncoder();
 
-        const stream = new ReadableStream({
-          start(controller) {
-            const emit = (chunk: any) => controller.enqueue(te.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+        if (streamToolCalls.length > 0) {
+          // Emit any remaining clean text before the DSML block (not yet streamed)
+          const cleanContent = stripToolCallText(fullText).trim();
+          // Only emit text that wasn't already streamed in real-time
+          const unstreamedClean = streamedChars > 0
+            ? cleanContent.slice(Math.min(streamedChars, cleanContent.length)).trim()
+            : cleanContent;
+          console.log(`[ds-proxy] [${rid}] 🔧 stream: ${streamToolCalls.length} tool call(s), clean=${cleanContent.length} chars (${streamedChars} already streamed)`);
+          if (unstreamedClean) {
+            sseEmit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: unstreamedClean }, finish_reason: null }] });
+          }
+          for (let i = 0; i < streamToolCalls.length; i++) {
+            const tc = streamToolCalls[i];
+            const callId = `call_${Date.now()}_${i}`;
+            sseEmit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: callId, type: "function", function: { name: tc.name, arguments: JSON.stringify(tc.input) } }] }, finish_reason: null }] });
+          }
+          sseEmit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+        } else {
+          // No tool calls — emit any remaining text not yet streamed
+          const remaining = stripToolCallText(fullText.slice(streamedChars)).trim();
+          if (remaining) {
+            sseEmit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: remaining }, finish_reason: null }] });
+          }
+          sseEmit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+        }
 
-            if (streamToolCalls.length > 0) {
-              // Emit clean text (if any) then tool calls
-              const cleanContent = stripToolCallText(fullText).trim();
-              console.log(`[ds-proxy] [${rid}] 🔧 stream: ${streamToolCalls.length} tool call(s) extracted, clean text=${cleanContent.length} chars`);
+        try { streamController?.enqueue(te.encode("data: [DONE]\n\n")); } catch { /* closed */ }
+        try { streamController?.close(); } catch { /* already closed */ }
 
-              if (cleanContent) {
-                emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: cleanContent }, finish_reason: null }] });
-              }
-              // Emit tool calls
-              for (let i = 0; i < streamToolCalls.length; i++) {
-                const tc = streamToolCalls[i];
-                const callId = `call_${Date.now()}_${i}`;
-                emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: callId, type: "function", function: { name: tc.name, arguments: JSON.stringify(tc.input) } }] }, finish_reason: null }] });
-              }
-              emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
-            } else {
-              // No tool calls — emit clean text as normal stream
-              const cleanContent = stripToolCallText(fullText).trim() || fullText;
-              emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: cleanContent }, finish_reason: null }] });
-              emit({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-            }
-            controller.enqueue(te.encode("data: [DONE]\n\n"));
-            controller.close();
-          },
-        });
+        console.log(`[ds-proxy] [${rid}] ✓ stream done — account=${usedAcc!.email || "??"} chars=${fullText.length} chunks=${chunkCount} toolCalls=${streamToolCalls.length} streamed=${streamedChars} totalMs=${totalMs}`);
 
-        console.log(`[ds-proxy] [${rid}] ✓ stream done — account=${usedAcc!.email || "??"} chars=${fullText.length} chunks=${chunkCount} toolCalls=${streamToolCalls.length} totalMs=${totalMs}`);
-
-        return new Response(stream, {
-          headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "connection": "keep-alive" },
-        });
+        return responsePromise;
       }
 
       // ── Non-streaming ────────────────────────────────────────────────────
