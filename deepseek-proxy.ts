@@ -1243,7 +1243,8 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
   // Parser matches both full-width ｜ (U+FF5C, trained format) and ASCII | (U+007C, fallback).
   // The `string` attribute is required in V3.2+ — parser handles both with and without it.
   // Outer block name (tool_calls vs function_calls) is ignored — we match invoke tags directly.
-  const dsmlInvokeRegex = /<[｜|]?DSML[｜|]invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/[｜|]?DSML[｜|]invoke>/g;
+  // Closing slash is optional — R1 frequently generates <｜DSML｜invoke> instead of </｜DSML｜invoke>
+  const dsmlInvokeRegex = /<[｜|]?DSML[｜|]invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<[\/]?[｜|]?DSML[｜|]invoke>/g;
   // Matches both V3.2+ format (with string attr) and any parameter without the attr
   const dsmlParamRegex = /<[｜|]?DSML[｜|]parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?[^>]*>([\s\S]*?)<[\/]?[｜|]?DSML[｜|]parameter>/g;
   let m;
@@ -1370,12 +1371,12 @@ function extractToolCallsFromText(text: string, rid?: string): ParsedToolCall[] 
 function stripToolCallText(text: string): string {
   text = normalizeDsmlText(text);
   return text
-    // DSML V4: <｜DSML｜tool_calls>...</｜DSML｜tool_calls> (full-width or ASCII pipe)
-    .replace(/<[｜|]?DSML[｜|]tool_calls>[\s\S]*?<\/[｜|]?DSML[｜|]tool_calls>/g, "")
-    // DSML V3.2: <｜DSML｜function_calls>...</｜DSML｜function_calls>
-    .replace(/<[｜|]?DSML[｜|]function_calls>[\s\S]*?<\/[｜|]?DSML[｜|]function_calls>/g, "")
-    // Orphaned DSML invoke blocks (outer wrapper stripped or missing)
-    .replace(/<[｜|]?DSML[｜|]invoke[\s\S]*?<\/[｜|]?DSML[｜|]invoke>/g, "")
+    // DSML V4: <｜DSML｜tool_calls>...<[/]｜DSML｜tool_calls> (closing slash optional)
+    .replace(/<[｜|]?DSML[｜|]tool_calls>[\s\S]*?<[\/]?[｜|]?DSML[｜|]tool_calls>/g, "")
+    // DSML V3.2: <｜DSML｜function_calls>...<[/]｜DSML｜function_calls>
+    .replace(/<[｜|]?DSML[｜|]function_calls>[\s\S]*?<[\/]?[｜|]?DSML[｜|]function_calls>/g, "")
+    // Orphaned DSML invoke blocks (outer wrapper stripped or missing, closing slash optional)
+    .replace(/<[｜|]?DSML[｜|]invoke[\s\S]*?<[\/]?[｜|]?DSML[｜|]invoke>/g, "")
     // Pre-DSML legacy: <function_calls>...</function_calls>
     .replace(/<function_calls>[\s\S]*?<\/function_calls>/g, "")
     // Legacy: <tool_calls>...</tool_calls>
