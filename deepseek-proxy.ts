@@ -1167,29 +1167,48 @@ interface ParsedToolCall { name: string; input: Record<string, any> }
 /**
  * Normalize DSML-like tags to the canonical format <｜DSML｜...>.
  *
- * The model generates many variants of the DSML prefix:
- *   - <｜DSML｜tool_calls>    (correct, full-width pipe U+FF5C)
- *   - <DSML︵tool_calls>      (U+FE35 curved bracket — R1 variant)
- *   - <｜psml▁tool_calls>     (wrong prefix name + sentencepiece underbar)
- *   - <DSMLinvoke>             (missing pipes)
- *   - <|DSML|invoke>           (ASCII pipe)
+ * R1/expert mode generates random prefixes instead of DSML. Observed variants:
+ *   - <｜DSML｜tool_calls>       (correct)
+ *   - <｜psml▁tool_calls>        (wrong name + sentencepiece underbar)
+ *   - <｜pslit|tool_calls>        (wrong name + ASCII pipe)
+ *   - <＃dsml＃invoke>            (fullwidth # as separator)
+ *   - <｜ps＃dyllm＃calls>        (gibberish prefix with embedded keyword)
+ *   - <DSML︵tool_calls>          (curved bracket separator)
  *
- * All are structurally identical: open/close tags with invoke + parameter children.
- * This normalizer canonicalizes ALL variants so downstream parsing just works.
+ * Instead of whack-a-mole with specific prefixes, match ANY content between
+ * `<` and a known keyword (`tool_calls`, `function_calls`, `invoke`, `parameter`)
+ * and canonicalize to `<｜DSML｜keyword>`.
  */
 function normalizeDsmlText(text: string): string {
-  // Match any tag that looks like <[separator]WORD[separator]keyword> where
-  // keyword is tool_calls, function_calls, invoke, or parameter.
-  // Canonicalize to <｜DSML｜keyword>.
+  // Match opening tags: <[any non-alpha junk][any word(s)][any separator]keyword>
+  // The key insight: the KEYWORDS are always correct — only the prefix varies.
+  // Match: < + optional / + any mix of non-keyword chars + keyword
+  // Keywords must be at a word boundary to avoid false positives in normal text.
+  const KEYWORDS = "tool_calls|function_calls|invoke|parameter";
+
   return text
-    // Opening tags: <｜psml▁invoke>, <DSML︵tool_calls>, <|DSML|param>, etc.
-    .replace(/<[｜|]?(?:DSML|psml|dsml)[｜|▁︵︶（）]?(tool_calls|function_calls|invoke|parameter)/gi,
-      (_, keyword) => `<｜DSML｜${keyword.toLowerCase()}`)
-    // Closing tags: </｜psml▁invoke>, </DSML︵tool_calls>, etc.
-    .replace(/<\/[｜|]?(?:DSML|psml|dsml)[｜|▁︵︶（）]?(tool_calls|function_calls|invoke|parameter)/gi,
-      (_, keyword) => `</｜DSML｜${keyword.toLowerCase()}`)
-    // Closing delimiters inside parameter tags: value</｜psml▁parameter> etc.
-    .replace(/[｜|▁︵︶](?:DSML|psml|dsml)[｜|▁︵︶]?(parameter)>/gi,
+    // Opening tags: <｜psml▁invoke>, <＃dsml＃tool_calls>, <｜ps＃dyllm＃calls>, etc.
+    // Captures everything between < and the keyword, replaces with canonical prefix
+    .replace(new RegExp(`<([^a-zA-Z]*[a-zA-Z＃#][^>]*?)(${KEYWORDS})`, "gi"),
+      (match, prefix, keyword) => {
+        // Only normalize if prefix looks like a DSML-variant (contains non-ASCII or pipe-like chars)
+        // Skip if it looks like normal HTML/XML (e.g., <div>, <tool_result>)
+        if (/[｜|＃#▁︵︶（）\uff00-\uffff]/.test(prefix) || /dsml|psml|pslit/i.test(prefix)) {
+          return `<｜DSML｜${keyword.toLowerCase()}`;
+        }
+        return match; // Not a DSML variant, leave as-is
+      })
+    // Closing tags: </｜psml▁invoke>, </＃dsml＃tool_calls>, etc.
+    .replace(new RegExp(`<\\/([^a-zA-Z]*[a-zA-Z＃#][^>]*?)(${KEYWORDS})`, "gi"),
+      (match, prefix, keyword) => {
+        if (/[｜|＃#▁︵︶（）\uff00-\uffff]/.test(prefix) || /dsml|psml|pslit/i.test(prefix)) {
+          return `</｜DSML｜${keyword.toLowerCase()}`;
+        }
+        return match;
+      })
+    // Closing delimiters inside parameter values: value</｜???｜parameter>
+    // Also handles mid-tag separators like ｜psml▁parameter>
+    .replace(new RegExp(`[｜|＃#▁︵︶（）][^>]{0,20}?(parameter)>`, "gi"),
       `｜DSML｜parameter>`);
 }
 
