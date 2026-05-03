@@ -908,22 +908,66 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
     console.log(`[ds-proxy] [${rid}] [openAIToDS] injected ${tools.length} tool schemas (official DSML template, full-width ｜), tool_choice=${typeof toolChoice === "object" ? JSON.stringify(toolChoice) : toolChoice || "auto"}`);
   }
 
-  // ── Messages ──────────────────────────────────────────────────────────────
-  // When history was offloaded to a file, replace all messages with a single
-  // continuation instruction. The model reads the file as a document and picks
-  // up exactly where the conversation left off.
+  // ── Build conversation in official DeepSeek V4 format ─────────────────────
+  // Source: encoding_dsv4.py from HuggingFace (read directly, May 2026).
+  //
+  // V4 special tokens used in the prompt:
+  //   BOS:         <｜begin▁of▁sentence｜>            — first character of every prompt
+  //   User turn:   <｜User｜>{content}<｜Assistant｜></think>   — user msg + asst prefix (chat mode)
+  //   Asst turn:   {content}<｜end▁of▁sentence｜>              — response with EOS
+  //   Tool call:   {text}\n\n<｜DSML｜tool_calls>...</｜DSML｜tool_calls><｜end▁of▁sentence｜>
+  //   Tool result: <｜User｜><tool_result>{content}</tool_result><｜Assistant｜></think>
+  //     • NO tool_call_id attribute — training format has none
+  //     • Multiple results from same turn merged into ONE user block (V4 merge_tool_messages)
+  //
+  // Preamble (OUTPUT INTEGRITY GUARD, ## Tools) is joined before the conversation.
+
+  const EOS = "<｜end▁of▁sentence｜>";
+  const BOS = "<｜begin▁of▁sentence｜>";
+  const USER_TOKEN = "<｜User｜>";
+  const ASST_OPEN = "<｜Assistant｜></think>"; // chat mode: </think> closes thinking immediately
+
+  function extractText(msg: any): string {
+    return typeof msg.content === "string"
+      ? msg.content
+      : Array.isArray(msg.content)
+        ? msg.content.map((b: any) => b.text || "").join("")
+        : "";
+  }
+
+  function buildDsmlCalls(toolCalls: any[]): string {
+    // Source: encoding_dsv4.py tool_call_template + encode_arguments_to_dsml
+    return toolCalls.map((tc: any) => {
+      const name = tc.function?.name || tc.name || "unknown";
+      let argsObj: Record<string, any> = {};
+      try {
+        argsObj = typeof tc.function?.arguments === "string"
+          ? JSON.parse(tc.function.arguments)
+          : tc.function?.arguments || tc.input || {};
+      } catch { argsObj = {}; }
+      const params = Object.entries(argsObj).map(([k, v]) => {
+        const isStr = typeof v === "string";
+        const val = isStr ? String(v) : JSON.stringify(v);
+        // Full-width ｜ (U+FF5C) — exact p_dsml_template from encoding_dsv4.py
+        return `<｜DSML｜parameter name="${k}" string="${isStr}">${val}</｜DSML｜parameter>`;
+      }).join("\n");
+      return `<｜DSML｜invoke name="${name}">\n${params}\n</｜DSML｜invoke>`;
+    }).join("\n");
+  }
+
   let systemCount = 0, assistantCount = 0, toolResultCount = 0, userCount = 0;
 
+  // ── File-offload mode ─────────────────────────────────────────────────────
   if (offloadedFileId) {
-    // History is in the file — inject a single continuation prompt
-    parts.push(
-      `[USER]\n` +
-      `Continue from the latest state in the attached DS2API_HISTORY.txt context. ` +
-      `Treat it as the current working state and answer the latest user request directly. ` +
-      `Use ONLY data from the tool results in the attached history — do not fabricate any values.`
-    );
+    const preamble = parts.join("\n\n");
+    const prompt =
+      BOS + preamble + "\n\n" +
+      USER_TOKEN +
+      "Continue from the latest state in the attached DS2API_HISTORY.txt context. " +
+      "Treat it as the current working state and answer the latest user request directly. " +
+      "Use ONLY data from the tool results in the attached history — do not fabricate any values." +
+      ASST_OPEN;
     userCount++;
-    const prompt = parts.join("\n\n");
     console.log(`[ds-proxy] [${rid}] [openAIToDS] file-offload mode — prompt=${prompt.length} chars (history in file ${offloadedFileId})`);
     return {
       chat_session_id: sessionId,
@@ -936,85 +980,82 @@ function openAIToDS(body: any, sessionId: string, offloadedFileId?: string) {
     };
   }
 
+  // ── System messages → preamble (no [SYSTEM] label, content only) ─────────
   for (const msg of messages) {
-    const text = typeof msg.content === "string"
-      ? msg.content
-      : Array.isArray(msg.content)
-        ? msg.content.map((b: any) => b.text || "").join("")
-        : "";
-
     if (msg.role === "system") {
-      if (text) { parts.push(`[SYSTEM]\n${text}`); systemCount++; }
-    } else if (msg.role === "assistant") {
-      // Reconstruct prior tool calls in official DSML format (full-width ｜, correct closing tags,
-      // EOS token) so the model sees its own training format in conversation history.
-      // Source: encoding_dsv4.py tool_calls_template + tool_call_template + p_dsml_template
-      const toolCalls = (msg as any).tool_calls;
-      if (toolCalls?.length) {
-        const dsmlCalls = toolCalls.map((tc: any) => {
-          const name = tc.function?.name || tc.name || "unknown";
-          let argsObj: Record<string, any> = {};
-          try {
-            argsObj = typeof tc.function?.arguments === "string"
-              ? JSON.parse(tc.function.arguments)
-              : tc.function?.arguments || tc.input || {};
-          } catch { argsObj = {}; }
-          const params = Object.entries(argsObj).map(([k, v]) => {
-            const isStr = typeof v === "string";
-            const val = isStr ? String(v) : JSON.stringify(v);
-            // Full-width ｜ (U+FF5C) + correct closing tag with slash — exact p_dsml_template
-            return `<｜DSML｜parameter name="${k}" string="${isStr}">${val}</｜DSML｜parameter>`;
-          }).join("\n");
-          return `<｜DSML｜invoke name="${name}">\n${params}\n</｜DSML｜invoke>`;
-        }).join("\n");
-        // EOS token appended immediately after closing tag — required by official encoding
-        // (encoding_dsv4.py: the turn ends with </｜DSML｜tool_calls><｜end▁of▁sentence｜>)
-        parts.push(`[ASSISTANT]\n${text ? text + "\n\n" : ""}<｜DSML｜tool_calls>\n${dsmlCalls}\n</｜DSML｜tool_calls><｜end▁of▁sentence｜>`);
-        assistantCount++;
-      } else if (text) {
-        parts.push(`[ASSISTANT]\n${text}`);
-        assistantCount++;
-      }
-    } else if (msg.role === "tool") {
-      // Official V4 format: <tool_result> tags inside the user turn
-      // Source: encoding_dsv4.py tool_output_template = "<tool_result>{content}</tool_result>"
-      // V3.2 used <result> tags — the parser handles both on output; we inject V4 format.
-      const toolCallId = (msg as any).tool_call_id || "";
-      const resultAttr = toolCallId ? ` tool_call_id="${toolCallId}"` : "";
-      parts.push(`[USER]\n<tool_result${resultAttr}>\n${text}\n</tool_result>`);
-      toolResultCount++;
-    } else if (text) {
-      parts.push(text);
-      userCount++;
+      const text = extractText(msg);
+      if (text) { parts.push(text); systemCount++; }
     }
   }
 
-  // Echo-step grounding injection — placed LAST, right before generation.
-  // Research finding: forcing the model to echo tool result data first (Step 1)
-  // moves that data to the END of generation, making it a high-recency anchor
-  // for the final answer (Step 2). This is the most effective grounding technique
-  // at long contexts (from "Decoding Context Windows: Benchmarking DeepSeek 128k").
-  // Count constraint ("if the tool returned N items, list all N") adds a self-check.
-  // Only inject echo-step grounding when at least one tool result is substantial (>500 chars).
-  // Short results like {"count":14} or {"ok":true} don't need it — the instruction overhead
-  // outweighs the benefit and can confuse the model ("list every item" when there's nothing to list).
-  const hasSubstantialResult = parts.some(p => p.startsWith("[TOOL RESULT") && p.length > 500);
-  if (toolResultCount > 0 && hasSubstantialResult) {
-    parts.push(
-      `[USER]\n` +
+  // ── Conversation: non-system messages in V4 token format ─────────────────
+  // Consecutive tool messages merged into ONE user block (V4 merge_tool_messages).
+  let convStr = "";
+  let maxToolResultLen = 0; // track longest result for echo-step threshold
+
+  const nonSystem = messages.filter(m => m.role !== "system");
+  let i = 0;
+  while (i < nonSystem.length) {
+    const msg = nonSystem[i];
+    const text = extractText(msg);
+
+    if (msg.role === "user") {
+      convStr += `${USER_TOKEN}${text}${ASST_OPEN}`;
+      userCount++;
+      i++;
+    } else if (msg.role === "assistant") {
+      const toolCalls = (msg as any).tool_calls;
+      if (toolCalls?.length) {
+        const dsmlCalls = buildDsmlCalls(toolCalls);
+        // assistant_msg_template: {content}\n\n<｜DSML｜tool_calls>...</｜DSML｜tool_calls><EOS>
+        convStr += `${text ? text + "\n\n" : ""}<｜DSML｜tool_calls>\n${dsmlCalls}\n</｜DSML｜tool_calls>${EOS}`;
+        assistantCount++;
+      } else if (text) {
+        convStr += `${text}${EOS}`;
+        assistantCount++;
+      }
+      i++;
+    } else if (msg.role === "tool") {
+      // Merge ALL consecutive tool messages into ONE user block.
+      // V4 tool_output_template = "<tool_result>{content}</tool_result>" — no attributes.
+      // Multiple results: joined with "\n\n" inside the same <｜User｜> block.
+      const resultBlocks: string[] = [];
+      while (i < nonSystem.length && nonSystem[i].role === "tool") {
+        const toolText = extractText(nonSystem[i]);
+        resultBlocks.push(`<tool_result>\n${toolText}\n</tool_result>`);
+        if (toolText.length > maxToolResultLen) maxToolResultLen = toolText.length;
+        toolResultCount++;
+        i++;
+      }
+      convStr += `${USER_TOKEN}${resultBlocks.join("\n\n")}${ASST_OPEN}`;
+    } else {
+      // Unknown role: treat as user
+      if (text) { convStr += `${USER_TOKEN}${text}${ASST_OPEN}`; userCount++; }
+      i++;
+    }
+  }
+
+  // ── Echo-step grounding (only for substantial results >500 chars) ─────────
+  // Moves tool data to high-recency position at end of prompt; adds count constraint.
+  // Short results ({count:14}, {ok:true}) are excluded — overhead outweighs benefit.
+  const hasSubstantialResult = toolResultCount > 0 && maxToolResultLen > 500;
+  if (hasSubstantialResult) {
+    convStr +=
+      `${USER_TOKEN}` +
       `The tool returned the above data. Respond using this two-step approach:\n` +
-      `Step 1: List every item exactly as it appears in the [TOOL RESULT] block — copy names, IDs, and values verbatim, changing nothing.\n` +
+      `Step 1: List every item exactly as it appears in the tool result — copy names, IDs, and values verbatim, changing nothing.\n` +
       `Step 2: Using only that list from Step 1, answer the original request naturally.\n\n` +
       `CONSTRAINTS:\n` +
       `- If the tool returned N items, your response must contain exactly N items — no more, no fewer.\n` +
       `- NEVER invent, substitute, or paraphrase any name, ID, count, price, or identifier.\n` +
-      `- If you do not have the data, call a tool — never fabricate.`
-    );
+      `- If you do not have the data, call a tool — never fabricate.` +
+      ASST_OPEN;
     userCount++;
   }
 
-  const prompt = parts.join("\n\n");
-  console.log(`[ds-proxy] [${rid}] [openAIToDS] prompt=${prompt.length} chars | system=${systemCount} assistant=${assistantCount} tool_results=${toolResultCount} user=${userCount} tools=${tools.length}`);
+  const preamble = parts.join("\n\n");
+  const prompt = BOS + preamble + (convStr ? "\n\n" + convStr : "");
+  console.log(`[ds-proxy] [${rid}] [openAIToDS] prompt=${prompt.length} chars | system=${systemCount} assistant=${assistantCount} tool_results=${toolResultCount} user=${userCount} tools=${tools.length} echo_step=${hasSubstantialResult}`);
 
   return {
     chat_session_id: sessionId,
