@@ -1748,6 +1748,10 @@ Bun.serve({
         return Response.json({ error: "Unauthorized" }, { status: 401 });
       }
       const body = await req.json() as any;
+      // Debug: log what fields arrive for each account
+      (body.accounts || []).forEach((a: any) => {
+        console.log(`[ds-proxy] [${rid}] [reload-pool] incoming: email=${a.email} fields=${Object.keys(a).join(",")}`);
+      });
       const accounts: PoolAccount[] = (body.accounts || []).map((a: any) => ({
         token: a.token || "",
         email: a.email,
