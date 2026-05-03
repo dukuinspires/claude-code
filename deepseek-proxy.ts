@@ -615,15 +615,33 @@ async function getVpsPow(token: string, path: string): Promise<string | null> {
   return null;
 }
 
-async function getVpsSession(token: string): Promise<string | null> {
+async function getVpsSession(token: string): Promise<{ sessionId: string; toolSchemaFileId?: string } | null> {
   const res = await vpsCacheFetch(`/session?token=${encodeURIComponent(token)}`);
   if (!res) return null;
   const data = await res.json() as any;
   if (data.sessionId) {
-    console.log(`[ds-proxy] [vps-cache] session ${data.hit ? "HIT" : "created-on-vps"} (${data.sessionId.slice(0, 8)}...)`);
-    return data.sessionId;
+    console.log(`[ds-proxy] [vps-cache] session ${data.hit ? "HIT" : "created-on-vps"} (${data.sessionId.slice(0, 8)}...) schemaFile=${data.toolSchemaFileId || "none"}`);
+    return { sessionId: data.sessionId, toolSchemaFileId: data.toolSchemaFileId || undefined };
   }
   return null;
+}
+
+/** Push compressed tool schemas to VPS cache so it can pre-upload them to sessions */
+async function syncToolSchemasToVpsCache(tools: any[], rid: string): Promise<void> {
+  if (DS_CACHE_NODES.length === 0 || !tools.length) return;
+  const schemas = compressToolSchemas(tools, rid);
+  const body = JSON.stringify({ schemas });
+  for (const nodeUrl of DS_CACHE_NODES) {
+    try {
+      await fetch(`${nodeUrl}/tool-schemas`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-ds-cache-secret": DS_CACHE_SECRET },
+        body,
+        signal: AbortSignal.timeout(5000),
+      });
+    } catch { /* non-fatal */ }
+  }
+  console.log(`[ds-proxy] [${rid}] [vps-cache] synced ${schemas.length} tool schemas to VPS cache`);
 }
 
 /** Push current account tokens to ALL VPS cache nodes so they can pre-solve */
@@ -1011,8 +1029,8 @@ function compressToolSchemas(tools: any[], rid: string): any[] {
 function openAIToDS(
   body: any,
   sessionId: string,
-  contextFileId?: string,      // combined context file (tool schemas + history)
-  toolSchemasInFile?: boolean,  // true = schemas are in the file, don't inline
+  refFileIds?: string[],        // file IDs for ref_file_ids (schemas + history)
+  toolSchemasInFile?: boolean,  // true = schemas are in a file, don't inline
 ) {
   const messages: any[] = body.messages || [];
   const tools = body.tools || [];
@@ -1160,24 +1178,24 @@ function openAIToDS(
 
   let systemCount = 0, assistantCount = 0, toolResultCount = 0, userCount = 0;
 
-  // ── Context-file mode ────────────────────────────────────────────────────
-  // Tool schemas + conversation history are in the uploaded file.
+  // ── File-reference mode ──────────────────────────────────────────────────
+  // Tool schemas and/or conversation history are in uploaded files.
   // Prompt = preamble (DSML instruction, data rules) + brief reference.
-  if (contextFileId) {
+  if (refFileIds && refFileIds.length > 0) {
     const preamble = parts.join("\n\n");
     const prompt =
       preamble + "\n\n" +
       "[USER]\n" +
-      "The attached context file contains the tool definitions and the full conversation history. " +
+      "The attached file(s) contain the tool definitions and the full conversation history. " +
       "Answer the latest user request. If you need data, call the appropriate tool — " +
       "never fabricate or guess values.";
     userCount++;
-    console.log(`[ds-proxy] [${rid}] [openAIToDS] context-file mode — prompt=${prompt.length} chars (context in file ${contextFileId})`);
+    console.log(`[ds-proxy] [${rid}] [openAIToDS] file-ref mode — prompt=${prompt.length} chars, ref_files=${refFileIds.length}`);
     return {
       chat_session_id: sessionId,
       parent_message_id: null,
       prompt,
-      ref_file_ids: [contextFileId],
+      ref_file_ids: refFileIds,
       thinking_enabled: !!body.thinking_enabled,
       search_enabled: !!body.search_enabled,
       model_type: selectModelType(body),
@@ -1580,13 +1598,14 @@ async function doCompletion(body: any, acc: PoolAccount, rid: string) {
   }
 
   // Try VPS cache for session + PoW in parallel
-  const [vpsSession, vpsPow] = await Promise.all([
+  const [vpsSessionResult, vpsPow] = await Promise.all([
     getVpsSession(acc.token),
     getVpsPow(acc.token, "/api/v0/chat/completion"),
   ]);
 
   // Fall back to on-demand for anything the VPS didn't provide
-  let sessionId = vpsSession;
+  let sessionId = vpsSessionResult?.sessionId || null;
+  let toolSchemaFileId = vpsSessionResult?.toolSchemaFileId; // pre-uploaded by VPS
   let completionPow = vpsPow;
 
   if (!sessionId || !completionPow) {
@@ -1608,23 +1627,45 @@ async function doCompletion(body: any, acc: PoolAccount, rid: string) {
   if (!sessionId) {
     throw new Error("Session create failed (both VPS cache and on-demand)");
   }
-  console.log(`[ds-proxy] [completion] [${rid}] session=${sessionId} pow=${completionPow ? "ready" : "skipped"} vps=${vpsSession ? "hit" : "miss"}+${vpsPow ? "hit" : "miss"} (${Date.now() - t0}ms setup)`);
+  console.log(`[ds-proxy] [completion] [${rid}] session=${sessionId} pow=${completionPow ? "ready" : "skipped"} schemaFile=${toolSchemaFileId || "none"} vps=${vpsSessionResult ? "hit" : "miss"}+${vpsPow ? "hit" : "miss"} (${Date.now() - t0}ms setup)`);
 
   // ── Phase 2: Context file upload (multi-turn only) ──────────────────────
-  // Runs AFTER session is ready. PoW for file upload is separate from
-  // completion PoW. The completion PoW was already solved in Phase 1.
+  // If VPS pre-uploaded tool schemas, only upload conversation HISTORY (smaller).
+  // Otherwise upload the full context file (schemas + history).
   let contextFileId: string | undefined;
   let toolSchemasInFile = false;
+  const refFileIds: string[] = [];
 
-  if (isMultiTurn && contextContent) {
-    console.log(`[ds-proxy] [${rid}] [context-file] multi-turn (${messages.length} msgs) — uploading ${contextContent.length} chars`);
-    contextFileId = await uploadHistoryFile(acc, contextContent, modelType, rid) || undefined;
-    if (contextFileId) {
+  if (toolSchemaFileId) {
+    refFileIds.push(toolSchemaFileId);
+    toolSchemasInFile = true;
+  }
+
+  if (isMultiTurn) {
+    // If schemas are already in a pre-uploaded file, only build history
+    const fileContent = toolSchemaFileId
+      ? buildHistoryTranscript(messages)  // history only — schemas are in the pre-uploaded file
+      : contextContent!;                  // full context (schemas + history)
+
+    const fileSize = toolSchemaFileId
+      ? fileContent.length
+      : contextContent!.length;
+
+    console.log(`[ds-proxy] [${rid}] [context-file] multi-turn (${messages.length} msgs) — uploading ${fileSize} chars ${toolSchemaFileId ? "(history only, schemas pre-uploaded)" : "(full context)"}`);
+    const historyFileId = await uploadHistoryFile(acc, fileContent, modelType, rid) || undefined;
+    if (historyFileId) {
+      refFileIds.push(historyFileId);
       toolSchemasInFile = true;
-      console.log(`[ds-proxy] [${rid}] [context-file] ✓ uploaded ${contextFileId} — prompt ~2K (${Date.now() - t0}ms total setup)`);
+      console.log(`[ds-proxy] [${rid}] [context-file] ✓ uploaded ${historyFileId} — ref_files=${refFileIds.length} (${Date.now() - t0}ms total setup)`);
     } else {
       console.warn(`[ds-proxy] [${rid}] [context-file] ⚠ upload failed — falling back to inline`);
+      // If schema file was pre-uploaded but history failed, we still have schemas in file
     }
+  }
+
+  // Sync tool schemas to VPS on first request (so next sessions have them pre-uploaded)
+  if (tools.length > 0 && !toolSchemaFileId && isMultiTurn) {
+    syncToolSchemasToVpsCache(tools, rid).catch(() => {});
   }
 
   // ── Phase 3: Send completion request ────────────────────────────────────
@@ -1632,7 +1673,7 @@ async function doCompletion(body: any, acc: PoolAccount, rid: string) {
   const upstream = await fetch(`${DS_API}/api/v0/chat/completion`, {
     method: "POST",
     headers: dsHeaders(acc, completionPow),
-    body: JSON.stringify(openAIToDS({ ...body, _rid: rid }, sessionId, contextFileId, toolSchemasInFile)),
+    body: JSON.stringify(openAIToDS({ ...body, _rid: rid }, sessionId, refFileIds.length > 0 ? refFileIds : undefined, toolSchemasInFile)),
   });
   console.log(`[ds-proxy] [completion] [${rid}] upstream HTTP ${upstream.status} (${Date.now() - t0}ms total)`);
 

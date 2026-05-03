@@ -133,8 +133,75 @@ async function preSolvePow(token, path) {
   }
 }
 
+// ─── Tool Schema File Upload ─────────────────────────────────────────────────
+// Tool schemas are the same 42 tools on every request (43K chars compressed).
+// Pre-upload them when creating each session so the proxy doesn't have to.
+let cachedToolSchemas = null; // set via POST /tool-schemas
+
+async function uploadToolSchemaFile(token, sessionId) {
+  if (!cachedToolSchemas) return null;
+  const t0 = Date.now();
+
+  // Solve PoW for file upload
+  const powResult = await fetchAndSolvePoW(token, "/api/v0/file/upload_file");
+  if (!powResult) return null;
+
+  const content = `# Tool Schemas\n\n${JSON.stringify(cachedToolSchemas, null, 2)}`;
+  const fileBytes = new TextEncoder().encode(content);
+  const boundary = `----FormBoundary${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+  const headerPart = new TextEncoder().encode(
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="TOOL_SCHEMAS.json"\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n`
+  );
+  const footerPart = new TextEncoder().encode(`\r\n--${boundary}--\r\n`);
+  const bodyBuf = new Uint8Array(headerPart.length + fileBytes.length + footerPart.length);
+  bodyBuf.set(headerPart, 0);
+  bodyBuf.set(fileBytes, headerPart.length);
+  bodyBuf.set(footerPart, headerPart.length + fileBytes.length);
+
+  const res = await fetch(`${DS_API}/api/v0/file/upload_file`, {
+    method: "POST",
+    headers: {
+      "authorization": `Bearer ${token}`,
+      "content-type": `multipart/form-data; boundary=${boundary}`,
+      "x-app-version": "20241129.1",
+      "x-client-platform": "web",
+      "x-client-version": "1.8.0",
+      "x-model-type": "default",
+      "x-ds-pow-response": powResult.solved,
+      "x-file-size": String(fileBytes.length),
+      "x-thinking-enabled": "1",
+      "referer": "https://chat.deepseek.com/",
+      "origin": "https://chat.deepseek.com",
+      "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36",
+    },
+    body: bodyBuf,
+  });
+  const data = await res.json();
+  const fileId = data?.data?.biz_data?.file?.id || data?.data?.biz_data?.id || data?.data?.file?.id || data?.file_id;
+  if (!fileId) return null;
+
+  // Poll until ready (max 15s)
+  for (let i = 0; i < 15; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    try {
+      const pollRes = await fetch(`${DS_API}/api/v0/file/fetch_files?file_ids=${fileId}`, {
+        headers: { "authorization": `Bearer ${token}`, "x-app-version": "20241129.1", "x-client-platform": "web" },
+      });
+      const pollData = await pollRes.json();
+      const files = pollData?.data?.biz_data?.files || pollData?.data?.files || [];
+      const file = files.find((f) => f.id === fileId || f.file_id === fileId);
+      const status = (file?.status || "").toLowerCase();
+      if (["processed", "ready", "done", "available", "success", "completed", "finished"].includes(status)) {
+        console.log(`[ds-cache] [schema-file] uploaded ${content.length} chars → ${fileId} in ${Date.now() - t0}ms`);
+        return fileId;
+      }
+    } catch { /* retry */ }
+  }
+  return null;
+}
+
 // ─── Session Pool ────────────────────────────────────────────────────────────
-// Key: tokenHash → [{ sessionId, createdAt }]
+// Key: tokenHash → [{ sessionId, toolSchemaFileId, createdAt }]
 const sessionPool = new Map();
 const SESSION_TTL_MS = 10 * 60 * 1000; // 10 min max age
 const MAX_SESSIONS_PER_ACCOUNT = 3;
@@ -180,17 +247,30 @@ async function createSession(token) {
 async function preCreateSession(token) {
   const key = sessionPoolKey(token);
   const pool = sessionPool.get(key) || [];
-  // Clean expired
   const valid = pool.filter((s) => Date.now() - s.createdAt < SESSION_TTL_MS);
   if (valid.length >= MAX_SESSIONS_PER_ACCOUNT) return;
 
   try {
     const session = await createSession(token);
-    if (session) {
-      valid.push(session);
-      sessionPool.set(key, valid);
-      console.log(`[ds-cache] [session] pre-created in ${session.ms}ms (pool=${valid.length}/${MAX_SESSIONS_PER_ACCOUNT})`);
+    if (!session) return;
+
+    // Pre-upload tool schemas to this session (if schemas are cached)
+    let toolSchemaFileId = null;
+    if (cachedToolSchemas) {
+      try {
+        toolSchemaFileId = await uploadToolSchemaFile(token, session.sessionId);
+      } catch (e) {
+        console.warn(`[ds-cache] [session] schema upload failed: ${e.message}`);
+      }
     }
+
+    valid.push({ ...session, toolSchemaFileId });
+    sessionPool.set(key, valid);
+    console.log(
+      `[ds-cache] [session] pre-created in ${session.ms}ms` +
+      (toolSchemaFileId ? ` + schema file ${toolSchemaFileId}` : " (no schemas)") +
+      ` (pool=${valid.length}/${MAX_SESSIONS_PER_ACCOUNT})`
+    );
   } catch (e) {
     console.warn(`[ds-cache] [session] pre-create failed: ${e.message}`);
   }
@@ -282,16 +362,24 @@ const server = Bun.serve({
       const cached = getCachedSession(token);
       if (cached) {
         stats.sessionHits++;
-        console.log(`[ds-cache] [session] cache HIT (age=${Math.round((Date.now() - cached.createdAt) / 1000)}s)`);
-        return Response.json({ hit: true, sessionId: cached.sessionId, createdAt: cached.createdAt });
+        console.log(`[ds-cache] [session] cache HIT (age=${Math.round((Date.now() - cached.createdAt) / 1000)}s, schemaFile=${cached.toolSchemaFileId || "none"})`);
+        return Response.json({ hit: true, sessionId: cached.sessionId, toolSchemaFileId: cached.toolSchemaFileId || null, createdAt: cached.createdAt });
       }
 
-      // Cache miss — create on demand
+      // Cache miss — create on demand (no schema upload on-demand, too slow)
       stats.sessionMisses++;
       console.log(`[ds-cache] [session] cache MISS — creating on demand`);
       const session = await createSession(token);
       if (!session) return Response.json({ error: "session create failed" }, { status: 500 });
-      return Response.json({ hit: false, sessionId: session.sessionId, ms: session.ms });
+      return Response.json({ hit: false, sessionId: session.sessionId, toolSchemaFileId: null, ms: session.ms });
+    }
+
+    // POST /tool-schemas — cache the compressed tool schemas for pre-upload
+    if (url.pathname === "/tool-schemas" && req.method === "POST") {
+      const body = await req.json();
+      cachedToolSchemas = body.schemas;
+      console.log(`[ds-cache] [tool-schemas] cached ${(cachedToolSchemas || []).length} tool schemas (${JSON.stringify(cachedToolSchemas).length} chars)`);
+      return Response.json({ ok: true, count: (cachedToolSchemas || []).length });
     }
 
     // POST /accounts — update account list for pre-solving
