@@ -917,7 +917,7 @@ function openAIToDS(
     "Output only correct, coherent content derived from actual tool results."
   );
 
-  // ── Data integrity rules ──────────────────────────────────────────────────
+  // ── Data integrity + response quality rules ────────────────────────────
   // Separated from the DSML template — the official training template does NOT
   // include these. Placing them here (in the system preamble) avoids conflicting
   // with the trained tool-calling instruction format.
@@ -926,7 +926,13 @@ function openAIToDS(
       "DATA RULES: Always call a tool to answer data questions (lists, counts, names, statuses). " +
       "Never answer data questions from memory or context. Tool results are authoritative — " +
       "never fabricate, invent, or substitute any names, IDs, counts, or values. " +
-      "If a tool returns N items, reference exactly those N items verbatim."
+      "If a tool returns N items, reference exactly those N items verbatim.\n\n" +
+      "RESPONSE FORMAT: " +
+      "Use markdown tables for structured/tabular data (never bullet lists for items with multiple fields). " +
+      "When reporting metrics, identify anomalies and explain them (e.g. 0% open rate = tracking disabled). " +
+      "End data responses with 1-2 specific follow-up suggestions the user might want next. " +
+      "For system health or diagnostics, quantify each issue and suggest a concrete fix. " +
+      "Be thorough but concise — present the data first, then your analysis."
     );
   }
 
@@ -1064,7 +1070,7 @@ function openAIToDS(
       ref_file_ids: [contextFileId],
       thinking_enabled: !!body.thinking_enabled,
       search_enabled: !!body.search_enabled,
-      model_type: body.model_type || "expert",
+      model_type: selectModelType(body),
     };
   }
 
@@ -1153,7 +1159,7 @@ function openAIToDS(
     // model_type controls Chat (V3/V4-Flash, better tool calling) vs Expert (R1/V4-Pro, reasoning)
     // Default to "chat" — V3/Flash follows DSML format more reliably, no <think> blocks,
     // higher input tolerance. Use "expert" only when caller explicitly requests reasoning.
-    model_type: body.model_type || "expert",
+    model_type: selectModelType(body),
   };
 }
 
@@ -1402,64 +1408,83 @@ async function isExpiredToken(res: Response): Promise<{ expired: boolean; text: 
   return { expired: false, text };
 }
 
+// ─── Smart model_type selection ──────────────────────────────────────────────
+// "default" = V3/V4-Flash — better DSML compliance, faster, better tool calling
+// "expert"  = R1/V4-Pro   — stronger reasoning, slower, unreliable DSML variants
+// Use "default" for tool-heavy requests; "expert" only when reasoning is needed.
+function selectModelType(body: any): string {
+  if (body.model_type && body.model_type !== "expert") return body.model_type;
+  if (body.thinking_enabled) return "expert"; // explicit reasoning requested
+  const tools = body.tools || [];
+  if (tools.length > 0) return "default"; // tool calling → V3 for reliability
+  return body.model_type || "default";
+}
+
 // ─── Core completion (one attempt with a given account) ───────────────────────
 async function doCompletion(body: any, acc: PoolAccount, rid: string) {
-  console.log(`[ds-proxy] [completion] [${rid}] creating session for ${acc.email || "??"}`);
   const t0 = Date.now();
-  const sessionRes = await fetch(`${DS_API}/api/v0/chat_session/create`, {
-    method: "POST",
-    headers: dsHeaders(acc),
-    body: JSON.stringify({ agent: "chat", character_id: null }),
-  });
+  const messages: any[] = body.messages || [];
+  const tools: any[] = body.tools || [];
+  const modelType = selectModelType(body);
+  const isMultiTurn = tools.length > 0 && messages.length > 2;
+
+  // ── Phase 1: Parallel setup ─────────────────────────────────────────────
+  // Session create (337ms) + completion PoW (381ms) run in parallel.
+  // For multi-turn: also prepare the context file content synchronously
+  // (CPU-bound, ~5ms) so it's ready for upload immediately.
+  console.log(`[ds-proxy] [completion] [${rid}] parallel setup for ${acc.email || "??"} (multiTurn=${isMultiTurn} model=${modelType})`);
+
+  let contextContent: string | undefined;
+  let toolSchemas: any[] | undefined;
+  if (isMultiTurn) {
+    toolSchemas = compressToolSchemas(tools, rid);
+    contextContent = buildContextFile(messages, toolSchemas);
+  }
+
+  const [sessionRes, completionPow] = await Promise.all([
+    fetch(`${DS_API}/api/v0/chat_session/create`, {
+      method: "POST",
+      headers: dsHeaders(acc),
+      body: JSON.stringify({ agent: "chat", character_id: null }),
+    }),
+    getPowResponse("/api/v0/chat/completion", acc.token),
+  ]);
+
   const sessionData = await sessionRes.json() as any;
   const sessionId = sessionData?.data?.biz_data?.chat_session?.id;
   if (!sessionId) {
     console.error(`[ds-proxy] [completion] [${rid}] ✗ session create failed HTTP ${sessionRes.status}: ${JSON.stringify(sessionData).slice(0, 200)}`);
     throw new Error(`Session create failed: ${JSON.stringify(sessionData).slice(0, 200)}`);
   }
-  console.log(`[ds-proxy] [completion] [${rid}] session=${sessionId} (${Date.now() - t0}ms)`);
+  console.log(`[ds-proxy] [completion] [${rid}] session=${sessionId} pow=${completionPow ? "solved" : "skipped"} (${Date.now() - t0}ms parallel setup)`);
 
-  // ── Context file upload ──────────────────────────────────────────────────
-  // Strategy (from ds2api research + empirical testing):
-  //   First turn (messages ≤ 2):  inline everything — prompt ~52K fits fine.
-  //   Multi-turn (messages > 2):  upload context file (tool schemas + history)
-  //                                via ref_file_ids — prompt drops to ~2K.
-  //
-  // The web API input limit applies ONLY to the `prompt` field. Content in
-  // ref_file_ids is processed separately — no limit. This eliminates all
-  // prompt growth concerns for multi-turn agentic conversations.
+  // ── Phase 2: Context file upload (multi-turn only) ──────────────────────
+  // Runs AFTER session is ready. PoW for file upload is separate from
+  // completion PoW. The completion PoW was already solved in Phase 1.
   let contextFileId: string | undefined;
   let toolSchemasInFile = false;
-  const messages: any[] = body.messages || [];
-  const tools: any[] = body.tools || [];
-  const modelType: string = body.model_type || "expert";
 
-  const isMultiTurn = tools.length > 0 && messages.length > 2;
-  if (isMultiTurn) {
-    // Build combined context file: tool schemas + full conversation history
-    const toolSchemas = compressToolSchemas(tools, rid);
-    const contextContent = buildContextFile(messages, toolSchemas);
-    console.log(`[ds-proxy] [${rid}] [context-file] multi-turn detected (${messages.length} msgs) — uploading context file (${contextContent.length} chars)`);
+  if (isMultiTurn && contextContent) {
+    console.log(`[ds-proxy] [${rid}] [context-file] multi-turn (${messages.length} msgs) — uploading ${contextContent.length} chars`);
     contextFileId = await uploadHistoryFile(acc, contextContent, modelType, rid) || undefined;
     if (contextFileId) {
       toolSchemasInFile = true;
-      console.log(`[ds-proxy] [${rid}] [context-file] ✓ context uploaded to ${contextFileId} — prompt will be ~2K`);
+      console.log(`[ds-proxy] [${rid}] [context-file] ✓ uploaded ${contextFileId} — prompt ~2K (${Date.now() - t0}ms total setup)`);
     } else {
       console.warn(`[ds-proxy] [${rid}] [context-file] ⚠ upload failed — falling back to inline`);
     }
   }
 
-  const pow = await getPowResponse("/api/v0/chat/completion", acc.token);
-  console.log(`[ds-proxy] [completion] [${rid}] PoW=${pow ? "solved" : "skipped"} — calling /chat/completion`);
-
+  // ── Phase 3: Send completion request ────────────────────────────────────
+  // completionPow was pre-solved in Phase 1, no wait here.
   const upstream = await fetch(`${DS_API}/api/v0/chat/completion`, {
     method: "POST",
-    headers: dsHeaders(acc, pow),
+    headers: dsHeaders(acc, completionPow),
     body: JSON.stringify(openAIToDS({ ...body, _rid: rid }, sessionId, contextFileId, toolSchemasInFile)),
   });
   console.log(`[ds-proxy] [completion] [${rid}] upstream HTTP ${upstream.status} (${Date.now() - t0}ms total)`);
 
-  return { upstream, sessionId, pow };
+  return { upstream, sessionId, pow: completionPow };
 }
 
 // ─── Notify SmartAssist when pool is exhausted ────────────────────────────────
@@ -1736,7 +1761,7 @@ Bun.serve({
         max_tokens: anthropicBody.max_tokens || 4096,
         temperature: anthropicBody.temperature,
         stream: isStream,
-        model_type: "expert",
+        model_type: anthropicBody.thinking ? "expert" : (oaiTools.length > 0 ? "default" : "expert"),
         ...(anthropicBody.thinking ? { thinking_enabled: true } : {}),
       };
 
