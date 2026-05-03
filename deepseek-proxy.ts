@@ -2198,7 +2198,12 @@ Bun.serve({
           break;
         } catch (err: any) {
           console.error(`[ds-proxy] [${rid}] ✗ doCompletion threw (${acc.email}): ${err.message}`);
-          coolAccount(acc);
+          // If the error contains 40003, the token is expired — trigger relogin, not just cooldown
+          if (err.message?.includes("40003")) {
+            expireAccount(acc);
+          } else {
+            coolAccount(acc);
+          }
           continue;
         }
       }
